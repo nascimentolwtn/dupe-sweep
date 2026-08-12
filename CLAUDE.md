@@ -48,6 +48,22 @@ flutter analyze
 dart format lib/ test/
 ```
 
+### Daily Development Commands
+```bash
+# Check connected devices
+flutter devices
+
+# View app logs in real-time
+flutter logs
+
+# Troubleshoot environment setup
+flutter doctor
+
+# Restart ADB (if device connection issues)
+adb kill-server
+adb start-server
+```
+
 ## Architecture
 
 ### State Management
