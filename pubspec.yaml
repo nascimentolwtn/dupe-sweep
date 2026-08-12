@@ -1,0 +1,27 @@
+name: dupesweep
+description: A personal Android app to find and review duplicate photos on your device.
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  provider: ^6.0.0
+  photo_manager: ^2.7.0
+  permission_handler: ^11.4.0
+  image: ^4.0.0
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^2.0.0
+
+flutter:
+  uses-material-design: true
+  assets:
+    - assets/
