@@ -1,0 +1,12 @@
+# Generated run artifacts — contain real file paths and embedded photo
+# thumbnails from whatever library was scanned. Never commit these.
+run/
+*.json
+duplicate_report.md
+duplicate_report.csv
+duplicate_review.html
+delete_list.csv
+review_progress.json
+hash_cache.json
+score_cache.json
+thumb_cache.json
