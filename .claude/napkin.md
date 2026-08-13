@@ -5,13 +5,29 @@
 - Keep recurring, high-value notes only.
 - Max 10 items per category.
 
+## Current Blocker: Isolate + Platform Channels
+
+**Issue**: Photo scanning runs in a Dart isolate (via `compute()`) to avoid blocking UI, but isolates can't access platform channels without proper initialization. PhotoManager requires platform channel access.
+- `BackgroundIsolateBinaryMessenger.ensureInitialized()` requires `ServicesBinding.rootIsolateToken` which is null in background isolate
+- Error: "The BackgroundIsolateBinaryMessenger.instance value is invalid..."
+- Result: 0 photos found, no scan happens
+
+**Options to fix**:
+1. **Remove isolate**: Run scan on main thread (simpler, but slower for large libraries—not ideal)
+2. **Defer hash computation**: Scan metadata in isolate, compute hashes on main thread after
+3. **Find proper isolate init**: Research photo_manager's isolate support
+
+**Recommended**: Option 2 - scan gets metadata fast, hash computation happens on main thread progressively
+
+---
+
 ## Feature Development Pipeline (Priority Order)
 
-### 1. Hash-Based Grouping Integration (Next Sprint)
+### 1. Hash-Based Grouping Integration (IN PROGRESS - BLOCKED)
 Integrate dHash (already computed in SimilarityService) into the review UI.
-- **Impact**: Enable users to find visually similar photos beyond time clustering
-- **Status**: dHash computed but not integrated into PhotoGroup grouping logic
-- **Effort**: Medium—modify SimilarityService to sub-group within time clusters by Hamming distance, update PhotoGroup model to track hash-based sub-groups
+- **Status**: Implemented hash computation + sub-grouping logic, **BLOCKED on isolate issue**
+- **What works**: Hash computation code, grouping by Hamming distance (tested in unit tests)
+- **What's broken**: Scanning returns 0 photos due to isolate platform channel access
 
 ### 2. Scoring UI Integration
 Auto-select "best" photo in each group based on sharpness + exposure scoring.

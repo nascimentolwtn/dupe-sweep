@@ -51,8 +51,8 @@ class SimilarityService {
           final pixel1 = gray.getPixelSafe(x, y);
           final pixel2 = gray.getPixelSafe(x + 1, y);
 
-          final lum1 = _getLuminance(pixel1);
-          final lum2 = _getLuminance(pixel2);
+          final lum1 = pixel1.r.toInt();
+          final lum2 = pixel2.r.toInt();
 
           hash = (hash << 1) | (lum1 > lum2 ? 1 : 0);
         }
@@ -114,11 +114,4 @@ class SimilarityService {
     return groups;
   }
 
-  static int _getLuminance(int pixel) {
-    // Extract RGB and compute luminance
-    final r = img.getRed(pixel);
-    final g = img.getGreen(pixel);
-    final b = img.getBlue(pixel);
-    return ((0.299 * r + 0.587 * g + 0.114 * b) * 255).toInt();
-  }
 }
