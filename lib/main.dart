@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
+import 'models/photo_group.dart';
+import 'models/photo_item.dart';
 import 'screens/permission_screen.dart';
 import 'screens/scan_progress_screen.dart';
 import 'screens/duplicate_review_screen.dart';
@@ -54,30 +56,3 @@ class AppStateProvider extends ChangeNotifier {
   }
 }
 
-class PhotoGroup {
-  final String id;
-  final List<PhotoItem> photos;
-  final DateTime timestamp;
-
-  PhotoGroup({
-    required this.id,
-    required this.photos,
-    required this.timestamp,
-  });
-}
-
-class PhotoItem {
-  final String id;
-  final String path;
-  final DateTime createDateTime;
-  final int fileSize;
-  bool isSelected;
-
-  PhotoItem({
-    required this.id,
-    required this.path,
-    required this.createDateTime,
-    required this.fileSize,
-    this.isSelected = false,
-  });
-}

@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import '../main.dart';
+import '../models/photo_group.dart';
 import '../utils/byte_formatter.dart';
 import '../services/deletion_service.dart';
 
@@ -17,8 +17,8 @@ class SummaryBar extends StatelessWidget {
     int totalReclaimable = 0;
 
     for (final group in groups) {
-      totalSelected += group.selectedCount;
-      totalReclaimable += group.reclaimableBytes;
+      totalSelected += group.selectedCount.toInt();
+      totalReclaimable += group.reclaimableBytes.toInt();
     }
 
     return Container(

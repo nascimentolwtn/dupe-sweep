@@ -1,6 +1,8 @@
 import 'package:flutter/material.dart';
 import 'package:photo_manager/photo_manager.dart';
-import '../main.dart';
+import 'dart:typed_data';
+import '../models/photo_group.dart';
+import '../models/photo_item.dart';
 import '../utils/byte_formatter.dart';
 
 class PhotoGroupCard extends StatefulWidget {

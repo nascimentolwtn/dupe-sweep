@@ -1,9 +1,10 @@
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart';
 import 'package:provider/provider.dart';
-import 'dart:isolate';
 import '../main.dart';
-import '../services/photo_scanner_service.dart';
+import '../models/photo_group.dart';
 import '../models/photo_item.dart';
+import '../services/photo_scanner_service.dart';
 import 'duplicate_review_screen.dart';
 
 class ScanProgressScreen extends StatefulWidget {
@@ -130,6 +131,6 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
   }
 }
 
-Future<List<PhotoItem>> _scanPhotosInIsolate(Void _) async {
+Future<List<PhotoItem>> _scanPhotosInIsolate(void _) async {
   return await PhotoScannerService.scanAllPhotos();
 }
