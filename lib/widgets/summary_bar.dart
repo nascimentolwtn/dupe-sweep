@@ -32,7 +32,14 @@ class SummaryBar extends StatelessWidget {
           ),
         ],
       ),
-      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+      padding: EdgeInsets.fromLTRB(
+        16,
+        12,
+        16,
+        // Add the system nav bar's inset so the buttons clear gesture-nav
+        // pill / 3-button nav on real devices instead of sitting behind it.
+        12 + MediaQuery.of(context).padding.bottom,
+      ),
       child: Column(
         mainAxisSize: MainAxisSize.min,
         children: [
