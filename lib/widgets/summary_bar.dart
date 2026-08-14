@@ -92,17 +92,24 @@ class SummaryBar extends StatelessWidget {
   void _showDeleteConfirmation(BuildContext context, int count) {
     showDialog(
       context: context,
-      builder: (context) => AlertDialog(
+      // Named distinctly from the outer `context` on purpose: reusing
+      // `context` here would shadow it, and the dialog's own context
+      // becomes unmounted the instant Navigator.pop(dialogContext) runs
+      // below -- if _performDeletion had been called with THAT context
+      // instead of the outer one, every `context.mounted` check inside it
+      // would already be false by the time the async delete finished,
+      // silently skipping both removeDeletedPhotos and the result SnackBar.
+      builder: (dialogContext) => AlertDialog(
         title: const Text('Confirm Delete'),
         content: Text('Delete $count photos? This cannot be undone.'),
         actions: [
           TextButton(
-            onPressed: () => Navigator.pop(context),
+            onPressed: () => Navigator.pop(dialogContext),
             child: const Text('Cancel'),
           ),
           TextButton(
             onPressed: () async {
-              Navigator.pop(context);
+              Navigator.pop(dialogContext);
               await _performDeletion(context);
             },
             child:
@@ -132,6 +139,9 @@ class SummaryBar extends StatelessWidget {
     try {
       final deletedIds = await DeletionService.deletePhotos(photosToDelete);
 
+      print('[SummaryBar] Post-delete: context.mounted=${context.mounted}, '
+          'deletedIds=${deletedIds.length}');
+
       if (deletedIds.isNotEmpty && context.mounted) {
         // Removes the deleted photos (and any group left with nothing to
         // compare) from the review list -- without this the screen kept
@@ -139,6 +149,7 @@ class SummaryBar extends StatelessWidget {
         context
             .read<AppStateProvider>()
             .removeDeletedPhotos(deletedIds.toSet());
+        print('[SummaryBar] removeDeletedPhotos called with $deletedIds');
       }
 
       if (context.mounted) {
