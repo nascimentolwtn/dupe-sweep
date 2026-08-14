@@ -80,6 +80,22 @@ class ScanCacheService {
   DateTime? _lastFlushTime;
   bool _loaded = false;
 
+  /// Guards against concurrent [flush] calls. `PhotoScannerService` calls
+  /// [maybeCheckpoint] from up to 16 concurrently-running futures per
+  /// batch (see `_kScanConcurrency`); since [recordProcessed] is
+  /// synchronous, several of those futures can see the checkpoint
+  /// threshold crossed in the same tick and all call [flush] before any
+  /// of them finishes. Without this guard, concurrent flushes race on the
+  /// same `scan_cache.json.tmp` path -- one call's `rename` removes the
+  /// temp file out from under another's, surfacing as a
+  /// `PathNotFoundException` on real devices (never seen in single-call
+  /// unit tests). A caller that arrives mid-flush just awaits the
+  /// in-flight write instead of starting a redundant, colliding one; any
+  /// entries recorded too late to make that snapshot are picked up by the
+  /// next periodic checkpoint or the unconditional flush at scan end, so
+  /// this stays safe under the existing "eventually persisted" contract.
+  Future<void>? _inFlightFlush;
+
   /// Read accessor for already-processed data (used by the scanner to skip
   /// work and by resume-summary UI).
   Map<String, CachedPhotoData> get cachedEntries => Map.unmodifiable(_entries);
@@ -196,8 +212,19 @@ class ScanCacheService {
   }
 
   /// Unconditional write-temp-then-rename of the whole in-memory map to
-  /// disk.
-  Future<void> flush() async {
+  /// disk. Safe to call concurrently -- see [_inFlightFlush].
+  Future<void> flush() {
+    final inFlight = _inFlightFlush;
+    if (inFlight != null) return inFlight;
+
+    final future = _doFlush();
+    _inFlightFlush = future;
+    return future.whenComplete(() {
+      _inFlightFlush = null;
+    });
+  }
+
+  Future<void> _doFlush() async {
     _updatedAtMillis = DateTime.now().millisecondsSinceEpoch;
 
     final payload = {

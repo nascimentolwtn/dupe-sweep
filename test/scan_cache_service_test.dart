@@ -196,6 +196,35 @@ void main() {
       expect(await file.exists(), isTrue);
     });
 
+    test(
+        'concurrent flush calls do not throw and all entries survive '
+        '(regression: real-device race where multiple in-flight scan '
+        'batches each crossed the checkpoint threshold and called flush '
+        'at once, racing on the shared .tmp file)', () async {
+      final service = ScanCacheService(directory: tempDir);
+      await service.load();
+
+      for (var i = 0; i < 20; i++) {
+        service.recordProcessed(
+          'id_$i',
+          CachedPhotoData(createDateTimeMillis: i, fileSize: i),
+        );
+      }
+
+      // Simulate several concurrently-running scan-batch futures all
+      // deciding to checkpoint in the same tick.
+      await Future.wait([
+        service.flush(),
+        service.flush(),
+        service.flush(),
+        service.flush(),
+      ]);
+
+      final reloaded = ScanCacheService(directory: tempDir);
+      await reloaded.load();
+      expect(reloaded.cachedEntries.length, 20);
+    });
+
     test('clear deletes the cache file and resets in-memory state', () async {
       final service = ScanCacheService(directory: tempDir);
       await service.load();
