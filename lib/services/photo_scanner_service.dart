@@ -206,10 +206,21 @@ class PhotoScannerService {
       // user action, not a scan failure, and callers need to handle it
       // distinctly (see `ScanCancelledException`'s doc comment).
       rethrow;
-    } catch (e) {
+    } catch (e, stackTrace) {
+      // Rethrow rather than returning [] -- a real failure here (e.g.
+      // permission revoked mid-scan, PhotoManager.getAssetPathList
+      // throwing) must not look identical to "scanned fine, found zero
+      // duplicates". Swallowing it here previously meant the caller
+      // treated a FAILED scan as a completed one: it built zero groups,
+      // showed "No duplicates found", and cleared the resume checkpoint
+      // on the way out -- silently discarding any real hashing progress
+      // from an interrupted run. Per-photo failures (a single unreadable
+      // thumbnail, a missing asset) are already handled gracefully inside
+      // _fetchMetadata/_computeHash and never reach this catch; only
+      // failures affecting the scan as a whole do.
       print('[PhotoScanner] ERROR: $e');
-      print('[PhotoScanner] StackTrace: $e');
-      return [];
+      print('[PhotoScanner] StackTrace: $stackTrace');
+      rethrow;
     }
   }
 
