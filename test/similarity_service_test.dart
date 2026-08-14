@@ -96,7 +96,9 @@ void main() {
 
         final distance = SimilarityService.hammingDistance(hash1, hash2);
 
-        expect(distance, 1);
+        // Bit-level, not hex-digit-level: '3' (0011) vs '4' (0100) differ
+        // in 3 bits, not "1 differing character".
+        expect(distance, 3);
       });
 
       test('returns 0 for identical hashes', () {
@@ -112,7 +114,8 @@ void main() {
 
         final distance = SimilarityService.hammingDistance(hash1, hash2);
 
-        expect(distance, 6);
+        // 6 hex digits = 24 bits, all differing.
+        expect(distance, 24);
       });
 
       test('handles mismatched lengths', () {
@@ -128,6 +131,32 @@ void main() {
         final distance = SimilarityService.hammingDistance('', 'abc');
 
         expect(distance, 999);
+      });
+
+      test(
+          'handles hashes with the top bit set (regression: int.parse '
+          'throws on values above the signed 64-bit range, which a '
+          '64-bit dHash hits roughly half the time)', () {
+        final distance = SimilarityService.hammingDistance(
+          '8000000000000000',
+          '0000000000000000',
+        );
+
+        expect(distance, 1);
+      });
+
+      test(
+          'two single-bit-different hex digits are NOT the same distance as '
+          'two maximally-different hex digits (regression: a previous '
+          'version compared hex characters, not bits, so \'0\' vs \'8\' '
+          '(1 bit) and \'0\' vs \'f\' (4 bits) both counted as "1")', () {
+        final oneBitOff = SimilarityService.hammingDistance(
+            '0000000000000000', '8000000000000000');
+        final fourBitsOff = SimilarityService.hammingDistance(
+            '0000000000000000', 'f000000000000000');
+
+        expect(oneBitOff, 1);
+        expect(fourBitsOff, 4);
       });
     });
 

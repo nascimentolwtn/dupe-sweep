@@ -65,17 +65,39 @@ class SimilarityService {
     }
   }
 
-  /// Calculate Hamming distance between two hashes.
+  /// Calculate Hamming distance between two hashes, in bits.
+  ///
+  /// [hash1]/[hash2] are hex strings (see [computeDHash]); this parses them
+  /// back to numbers and counts differing bits via XOR + popcount. A
+  /// previous version compared the strings hex-digit-by-hex-digit instead,
+  /// which is NOT the same thing: two digits that differ by a single bit
+  /// ('0' vs '8') counted identically to two that differ by all four
+  /// ('0' vs 'f'). That collapsed the real 0-64 bit range down to an
+  /// effective 0-16 "digit" range, so [defaultHammingDistanceThreshold]
+  /// (10, tuned for a 0-64 bit scale) was far looser than intended -- up to
+  /// ~40 real bits could differ and still count as "similar", which is why
+  /// visually unrelated photos were ending up in the same hash group.
+  ///
+  /// Uses [BigInt] rather than [int]: a 64-bit dHash with its top bit set
+  /// (roughly half of all possible hash values) exceeds Dart's signed
+  /// 64-bit `int` range and throws on `int.parse` -- `BigInt.parse` has no
+  /// such limit, so every hash value parses and compares correctly.
   static int hammingDistance(String hash1, String hash2) {
     if (hash1.isEmpty || hash2.isEmpty || hash1.length != hash2.length) {
       return 999;
     }
 
-    int distance = 0;
-    for (int i = 0; i < hash1.length; i++) {
-      if (hash1[i] != hash2[i]) distance++;
+    try {
+      var xor = BigInt.parse(hash1, radix: 16) ^ BigInt.parse(hash2, radix: 16);
+      var distance = 0;
+      while (xor > BigInt.zero) {
+        if (xor & BigInt.one == BigInt.one) distance++;
+        xor >>= 1;
+      }
+      return distance;
+    } on FormatException {
+      return 999;
     }
-    return distance;
   }
 
   /// Group photos by perceptual similarity using dHash.
