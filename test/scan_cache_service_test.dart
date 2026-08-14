@@ -249,6 +249,36 @@ void main() {
       expect(summary, isNull);
     });
 
+    test('setTotalKnownAssets persists across a flush and fresh load',
+        () async {
+      final service = ScanCacheService(directory: tempDir);
+      await service.load();
+      service.setTotalKnownAssets(42);
+      await service.flush();
+
+      final reloaded = ScanCacheService(directory: tempDir);
+      await reloaded.load();
+
+      expect(reloaded.totalKnownAssets, 42);
+    });
+
+    test('cachedEntries is unmodifiable', () async {
+      final service = ScanCacheService(directory: tempDir);
+      await service.load();
+      service.recordProcessed(
+        'a',
+        const CachedPhotoData(createDateTimeMillis: 1, fileSize: 1),
+      );
+
+      expect(
+        () => service.cachedEntries['b'] = const CachedPhotoData(
+          createDateTimeMillis: 2,
+          fileSize: 2,
+        ),
+        throwsUnsupportedError,
+      );
+    });
+
     test('peekSummary reports processed/total counts from a saved cache',
         () async {
       final service = ScanCacheService(directory: tempDir);

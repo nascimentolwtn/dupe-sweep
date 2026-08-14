@@ -11,6 +11,108 @@ PhotoItem _photo(String id, {int fileSize = 1000}) => PhotoItem(
     );
 
 void main() {
+  group('AppStateProvider.startScan', () {
+    test('sets isScanning true and resets progress to 0', () {
+      final provider = AppStateProvider();
+      provider.scanProgress = 0.75;
+
+      provider.startScan();
+
+      expect(provider.isScanning, isTrue);
+      expect(provider.scanProgress, 0.0);
+    });
+
+    test('notifies listeners', () {
+      final provider = AppStateProvider();
+      var notified = false;
+      provider.addListener(() => notified = true);
+
+      provider.startScan();
+
+      expect(notified, isTrue);
+    });
+  });
+
+  group('AppStateProvider.updateProgress', () {
+    test('sets scanProgress and scanStatus', () {
+      final provider = AppStateProvider();
+
+      provider.updateProgress(0.42, 'Hashing photos...');
+
+      expect(provider.scanProgress, 0.42);
+      expect(provider.scanStatus, 'Hashing photos...');
+    });
+
+    test('notifies listeners', () {
+      final provider = AppStateProvider();
+      var notified = false;
+      provider.addListener(() => notified = true);
+
+      provider.updateProgress(0.5, 'Scanning...');
+
+      expect(notified, isTrue);
+    });
+  });
+
+  group('AppStateProvider.finishScan', () {
+    test('sets photoGroups and clears isScanning', () {
+      final provider = AppStateProvider();
+      provider.isScanning = true;
+      final groups = [
+        PhotoGroup(
+          id: 'g1',
+          photos: [_photo('a'), _photo('b')],
+          timestamp: DateTime(2024, 1, 1),
+        ),
+      ];
+
+      provider.finishScan(groups);
+
+      expect(provider.photoGroups, groups);
+      expect(provider.isScanning, isFalse);
+    });
+
+    test('notifies listeners', () {
+      final provider = AppStateProvider();
+      var notified = false;
+      provider.addListener(() => notified = true);
+
+      provider.finishScan([]);
+
+      expect(notified, isTrue);
+    });
+  });
+
+  group('AppStateProvider.cancelScan', () {
+    test('clears isScanning without touching photoGroups', () {
+      final provider = AppStateProvider();
+      provider.isScanning = true;
+      final existingGroups = [
+        PhotoGroup(
+          id: 'g1',
+          photos: [_photo('a'), _photo('b')],
+          timestamp: DateTime(2024, 1, 1),
+        ),
+      ];
+      provider.photoGroups = existingGroups;
+
+      provider.cancelScan();
+
+      expect(provider.isScanning, isFalse);
+      expect(provider.photoGroups, existingGroups);
+    });
+
+    test('notifies listeners', () {
+      final provider = AppStateProvider();
+      var notified = false;
+      provider.addListener(() => notified = true);
+
+      provider.cancelScan();
+
+      expect(notified, isTrue);
+    });
+  });
+
   group('AppStateProvider.removeDeletedPhotos', () {
     test('removes only the deleted photos from each group', () {
       final provider = AppStateProvider();

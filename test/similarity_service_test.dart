@@ -1,9 +1,91 @@
+import 'dart:typed_data';
+
 import 'package:flutter_test/flutter_test.dart';
+import 'package:image/image.dart' as img;
 import 'package:dupesweep/services/similarity_service.dart';
 import 'package:dupesweep/models/photo_item.dart';
 
+/// Builds a small synthetic PNG in memory so [SimilarityService.computeDHash]
+/// can be exercised without needing a real photo file. [pixelFor] is called
+/// for every (x, y) coordinate and must return a 0-255 grayscale value.
+Uint8List _syntheticPng(
+  int width,
+  int height,
+  int Function(int x, int y) pixelFor,
+) {
+  final image = img.Image(width: width, height: height);
+  for (var y = 0; y < height; y++) {
+    for (var x = 0; x < width; x++) {
+      final v = pixelFor(x, y);
+      image.setPixelRgb(x, y, v, v, v);
+    }
+  }
+  return img.encodePng(image);
+}
+
 void main() {
   group('SimilarityService', () {
+    group('computeDHash', () {
+      test('returns a well-formed 16-hex-char hash for a valid image', () {
+        final bytes = _syntheticPng(16, 16, (x, y) => (x * 16) % 256);
+
+        final hash = SimilarityService.computeDHash(bytes);
+
+        expect(hash.length, 16);
+        expect(RegExp(r'^[0-9a-f]{16}$').hasMatch(hash), isTrue);
+      });
+
+      test('is deterministic: same image bytes produce the same hash', () {
+        final bytes = _syntheticPng(16, 16, (x, y) => (x * 16 + y) % 256);
+
+        final hash1 = SimilarityService.computeDHash(bytes);
+        final hash2 = SimilarityService.computeDHash(bytes);
+
+        expect(hash1, hash2);
+      });
+
+      test(
+          'a left-to-right ascending gradient and its mirror image produce '
+          'different hashes', () {
+        // Ascending gradient: each pixel brighter than the one to its left,
+        // so every horizontal comparison bit is the same direction.
+        final ascending = _syntheticPng(16, 16, (x, y) => (x * 16) % 256);
+        // Mirrored (descending) gradient: every comparison flips relative
+        // to the ascending version.
+        final descending =
+            _syntheticPng(16, 16, (x, y) => ((15 - x) * 16) % 256);
+
+        final hashAscending = SimilarityService.computeDHash(ascending);
+        final hashDescending = SimilarityService.computeDHash(descending);
+
+        expect(hashAscending, isNot(equals(hashDescending)));
+        expect(
+          SimilarityService.hammingDistance(hashAscending, hashDescending),
+          greaterThan(0),
+        );
+      });
+
+      test('returns an empty string for bytes that are not a decodable image',
+          () {
+        final bytes = Uint8List.fromList([1, 2, 3, 4, 5]);
+
+        final hash = SimilarityService.computeDHash(bytes);
+
+        expect(hash, '');
+      });
+
+      test(
+          'a uniform solid-color image hashes to all zero bits '
+          '(documents current behavior: dHash compares each pixel to its '
+          'right neighbor, and a flat image has no neighbor differences)', () {
+        final bytes = _syntheticPng(16, 16, (x, y) => 128);
+
+        final hash = SimilarityService.computeDHash(bytes);
+
+        expect(hash, '0000000000000000');
+      });
+    });
+
     group('clusterByTime', () {
       test('clusters photos within time window', () {
         final now = DateTime(2024, 1, 1, 12, 0, 0);
