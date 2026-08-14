@@ -161,6 +161,56 @@ void main() {
     });
   });
 
+  group('PhotoGroup.ensureBestElected', () {
+    test('does nothing when a photo is already flagged isBest', () {
+      final a = _photo('a', fileSize: 100, isBest: true);
+      final b = _photo('b', fileSize: 900);
+      final group = PhotoGroup(
+        id: 'g1',
+        photos: [a, b],
+        timestamp: DateTime(2024, 1, 1),
+      );
+
+      group.ensureBestElected();
+
+      // The larger file (b) is NOT promoted over the existing pick -- an
+      // existing isBest flag always wins, this only fills a gap.
+      expect(a.isBest, isTrue);
+      expect(b.isBest, isFalse);
+    });
+
+    test(
+        'elects the largest-file-size photo when none is flagged isBest '
+        '(regression: this is what removeDeletedPhotos calls after a '
+        'group loses its isBest photo to deletion, so a group is never '
+        'left with no keeper spared)', () {
+      final a = _photo('a', fileSize: 300);
+      final b = _photo('b', fileSize: 900);
+      final c = _photo('c', fileSize: 500);
+      final group = PhotoGroup(
+        id: 'g1',
+        photos: [a, b, c],
+        timestamp: DateTime(2024, 1, 1),
+      );
+
+      group.ensureBestElected();
+
+      expect(b.isBest, isTrue);
+      expect(a.isBest, isFalse);
+      expect(c.isBest, isFalse);
+    });
+
+    test('is a no-op for an empty photo list', () {
+      final group = PhotoGroup(
+        id: 'g1',
+        photos: [],
+        timestamp: DateTime(2024, 1, 1),
+      );
+
+      expect(() => group.ensureBestElected(), returnsNormally);
+    });
+  });
+
   group('PhotoGroup.deselectAll', () {
     test('clears isSelected on every photo, including isBest ones', () {
       final a = _photo('a', isSelected: true, isBest: true);

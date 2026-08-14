@@ -44,4 +44,17 @@ class PhotoGroup {
       photo.isSelected = false;
     }
   }
+
+  /// Marks the largest-file-size photo as [PhotoItem.isBest] if the group
+  /// doesn't already have one -- a no-op otherwise. This is the same
+  /// stopgap heuristic used when a group is first built (see
+  /// `buildPhotoGroups` in scan_progress_screen.dart), factored out here
+  /// so it can also run after a group loses photos to deletion: without
+  /// re-electing, a group whose isBest photo got deleted would have NO
+  /// best photo left, and "Select All Non-Best" would select every
+  /// remaining photo with no warning.
+  void ensureBestElected() {
+    if (photos.isEmpty || photos.any((p) => p.isBest)) return;
+    photos.reduce((a, b) => b.fileSize > a.fileSize ? b : a).isBest = true;
+  }
 }

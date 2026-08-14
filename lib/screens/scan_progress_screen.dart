@@ -225,6 +225,12 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
       print('Error during scan: $e');
       provider.cancelScan();
       _stopTiming();
+      // scanAllPhotos now rethrows instead of swallowing real failures, so
+      // this path no longer runs after the cache/checkpoint has been
+      // cleared -- any progress the failed run made (periodic checkpoints
+      // during hashing) is still on disk. Re-check so the user is offered
+      // resume rather than being silently pushed into a full rescan.
+      await _checkForResume();
       if (mounted) {
         setState(() {
           _cancelled = false;
@@ -397,6 +403,12 @@ List<PhotoGroup> buildPhotoGroups(List<PhotoItem> photos) {
     for (final subGroup in subGroups) {
       if (subGroup.length == 1) continue;
 
+      final group = PhotoGroup(
+        id: 'group_$groupIndex',
+        photos: subGroup,
+        timestamp: subGroup.first.createDateTime,
+        groupType: 'hash',
+      );
       // Stopgap "best" pick: largest file size, already fetched for every
       // photo during Phase 1 metadata, zero extra cost. Without marking
       // *some* photo isBest, `PhotoGroup.selectAllNonBest()` (the "Select
@@ -405,15 +417,12 @@ List<PhotoGroup> buildPhotoGroups(List<PhotoItem> photos) {
       // scoring (`ScoringService`, already implemented but not wired into
       // the scan pipeline) is the proper fix and remains a separate
       // backlog item; this only prevents the dangerous "select everything"
-      // behavior in the meantime.
-      subGroup.reduce((a, b) => b.fileSize > a.fileSize ? b : a).isBest = true;
+      // behavior in the meantime. Shared with `AppStateProvider.
+      // removeDeletedPhotos`, which re-runs this after a group loses its
+      // isBest photo to deletion.
+      group.ensureBestElected();
 
-      groups.add(PhotoGroup(
-        id: 'group_$groupIndex',
-        photos: subGroup,
-        timestamp: subGroup.first.createDateTime,
-        groupType: 'hash',
-      ));
+      groups.add(group);
       groupIndex++;
     }
   }

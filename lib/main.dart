@@ -85,6 +85,14 @@ class AppStateProvider extends ChangeNotifier {
       group.photos.removeWhere((p) => deletedIds.contains(p.id));
     }
     photoGroups.removeWhere((g) => g.photos.length <= 1);
+
+    // A surviving group may have lost its isBest photo to the delete --
+    // re-elect one so "Select All Non-Best" never ends up selecting every
+    // remaining photo in the group with no keeper spared.
+    for (final group in photoGroups) {
+      group.ensureBestElected();
+    }
+
     notifyListeners();
   }
 }

@@ -3,11 +3,13 @@ import 'package:dupesweep/main.dart';
 import 'package:dupesweep/models/photo_group.dart';
 import 'package:dupesweep/models/photo_item.dart';
 
-PhotoItem _photo(String id, {int fileSize = 1000}) => PhotoItem(
+PhotoItem _photo(String id, {int fileSize = 1000, bool isBest = false}) =>
+    PhotoItem(
       id: id,
       path: 'path_$id',
       createDateTime: DateTime(2024, 1, 1),
       fileSize: fileSize,
+      isBest: isBest,
     );
 
 void main() {
@@ -187,6 +189,53 @@ void main() {
 
       expect(notified, isFalse);
       expect(provider.photoGroups.single.photos.length, 2);
+    });
+
+    test(
+        're-elects a best photo for a group that loses its isBest photo '
+        '(regression: without this, a group whose BEST-marked photo gets '
+        'deleted has no keeper spared, so "Select All Non-Best" would '
+        'select every remaining photo)', () {
+      final best = _photo('a', fileSize: 900, isBest: true);
+      final b = _photo('b', fileSize: 300);
+      final c = _photo('c', fileSize: 500);
+      final provider = AppStateProvider();
+      provider.photoGroups = [
+        PhotoGroup(
+          id: 'g1',
+          photos: [best, b, c],
+          timestamp: DateTime(2024, 1, 1),
+        ),
+      ];
+
+      provider.removeDeletedPhotos({'a'});
+
+      final survivors = provider.photoGroups.single.photos;
+      expect(survivors.map((p) => p.id), containsAll(['b', 'c']));
+      expect(survivors.where((p) => p.isBest).length, 1);
+      // Largest remaining file (c, 500) is the new pick.
+      expect(survivors.firstWhere((p) => p.id == 'c').isBest, isTrue);
+    });
+
+    test('leaves the existing isBest photo alone when it survives deletion',
+        () {
+      final best = _photo('a', fileSize: 900, isBest: true);
+      final b = _photo('b', fileSize: 300);
+      final c = _photo('c', fileSize: 500);
+      final provider = AppStateProvider();
+      provider.photoGroups = [
+        PhotoGroup(
+          id: 'g1',
+          photos: [best, b, c],
+          timestamp: DateTime(2024, 1, 1),
+        ),
+      ];
+
+      provider.removeDeletedPhotos({'c'});
+
+      final survivors = provider.photoGroups.single.photos;
+      expect(survivors.where((p) => p.isBest).length, 1);
+      expect(survivors.firstWhere((p) => p.id == 'a').isBest, isTrue);
     });
   });
 }
