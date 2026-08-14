@@ -17,12 +17,14 @@ class PhotoGroup {
 
   int get selectedCount => photos.where((p) => p.isSelected).length;
 
-  int get deleteCount => photos.where((p) => p.isSelected && !p.isBest).length;
+  // No `!isBest` filter: isBest is only a heuristic guess the user can
+  // override, including deleting every photo in a group.
+  int get deleteCount => photos.where((p) => p.isSelected).length;
 
   int get reclaimableBytes {
     int total = 0;
     for (var photo in photos) {
-      if (photo.isSelected && !photo.isBest) {
+      if (photo.isSelected) {
         total += photo.fileSize;
       }
     }

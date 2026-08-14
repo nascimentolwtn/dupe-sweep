@@ -1,5 +1,9 @@
 import 'package:flutter/material.dart';
+import 'package:provider/provider.dart';
+import '../main.dart';
 import '../models/photo_group.dart';
+import '../screens/scan_progress_screen.dart';
+import '../theme/app_theme.dart';
 import '../utils/byte_formatter.dart';
 import '../services/deletion_service.dart';
 
@@ -22,13 +26,14 @@ class SummaryBar extends StatelessWidget {
     }
 
     return Container(
-      decoration: BoxDecoration(
-        color: Colors.white,
+      decoration: const BoxDecoration(
+        color: AppColors.surface,
+        border: Border(top: BorderSide(color: AppColors.border)),
         boxShadow: [
           BoxShadow(
-            color: Colors.black.withAlpha(25),
-            blurRadius: 4,
-            offset: const Offset(0, -2),
+            color: Colors.black54,
+            blurRadius: 12,
+            offset: Offset(0, -2),
           ),
         ],
       ),
@@ -46,7 +51,10 @@ class SummaryBar extends StatelessWidget {
           if (totalSelected > 0) ...[
             Text(
               'Delete ${totalSelected} photos? Reclaim ${ByteFormatter.format(totalReclaimable)}',
-              style: const TextStyle(fontSize: 14),
+              style: const TextStyle(
+                fontSize: 14,
+                color: AppColors.textPrimary,
+              ),
             ),
             const SizedBox(height: 12),
           ],
@@ -58,13 +66,19 @@ class SummaryBar extends StatelessWidget {
                     ? null
                     : () => _showDeleteConfirmation(context, totalSelected),
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: Colors.red,
+                  backgroundColor: AppColors.danger,
                   foregroundColor: Colors.white,
                 ),
                 child: const Text('Delete Selected'),
               ),
               ElevatedButton.icon(
-                onPressed: () {},
+                onPressed: () {
+                  Navigator.of(context).pushReplacement(
+                    MaterialPageRoute(
+                      builder: (_) => const ScanProgressScreen(),
+                    ),
+                  );
+                },
                 icon: const Icon(Icons.refresh),
                 label: const Text('Re-scan'),
               ),
@@ -91,7 +105,8 @@ class SummaryBar extends StatelessWidget {
               Navigator.pop(context);
               await _performDeletion(context);
             },
-            child: const Text('Delete', style: TextStyle(color: Colors.red)),
+            child:
+                const Text('Delete', style: TextStyle(color: AppColors.danger)),
           ),
         ],
       ),
@@ -99,23 +114,36 @@ class SummaryBar extends StatelessWidget {
   }
 
   Future<void> _performDeletion(BuildContext context) async {
-    final photosToDelete = <String>[];
+    // Deliberately no `!photo.isBest` filter here: `isBest` is only a
+    // stopgap "largest file size" guess (see scan_progress_screen.dart),
+    // not a guarantee -- the whole point of a manual review screen is that
+    // the user can override it, including deciding no photo in a group is
+    // worth keeping and deleting all of them.
+    final photosToDelete = <String>[
+      for (final group in groups)
+        for (final photo in group.photos)
+          if (photo.isSelected) photo.id,
+    ];
 
-    for (final group in groups) {
-      for (final photo in group.photos) {
-        if (photo.isSelected && !photo.isBest) {
-          photosToDelete.add(photo.id);
-        }
-      }
-    }
+    print('[SummaryBar] Delete requested: ${photosToDelete.length} photos');
 
     if (photosToDelete.isEmpty) return;
 
     try {
-      final deleted = await DeletionService.deletePhotos(photosToDelete);
+      final deletedIds = await DeletionService.deletePhotos(photosToDelete);
+
+      if (deletedIds.isNotEmpty && context.mounted) {
+        // Removes the deleted photos (and any group left with nothing to
+        // compare) from the review list -- without this the screen kept
+        // showing already-deleted photos until the next full re-scan.
+        context
+            .read<AppStateProvider>()
+            .removeDeletedPhotos(deletedIds.toSet());
+      }
+
       if (context.mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Deleted $deleted photos')),
+          SnackBar(content: Text('Deleted ${deletedIds.length} photos')),
         );
       }
     } catch (e) {

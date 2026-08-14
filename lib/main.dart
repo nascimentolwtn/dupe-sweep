@@ -59,4 +59,32 @@ class AppStateProvider extends ChangeNotifier {
     isScanning = false;
     notifyListeners();
   }
+
+  /// `PhotoItem.isSelected`/`PhotoGroup` selection state is mutated
+  /// directly (not through this provider) by `PhotoGroupCard`'s thumbnail
+  /// checkboxes, `PhotoFullscreenViewer`'s mark-for-deletion toggle, and
+  /// the "Select All Non-Best"/"Clear" buttons -- each of those already
+  /// calls its own local `setState()` for its own widget's visuals, but
+  /// that doesn't reach `SummaryBar`, a sibling widget with no ancestor
+  /// relationship to any of them. Call this after any such mutation so the
+  /// `Consumer<AppStateProvider>` wrapping the whole review screen (and
+  /// therefore `SummaryBar`) rebuilds and picks up the new selection count.
+  void refreshSelection() {
+    notifyListeners();
+  }
+
+  /// Removes successfully-deleted photos from every group, then drops any
+  /// group that's left with 1 or 0 photos -- same "nothing to compare"
+  /// rule the scan itself applies when first building groups, since a
+  /// group can end up a singleton after its duplicates are deleted just
+  /// as easily as it can start out that way.
+  void removeDeletedPhotos(Set<String> deletedIds) {
+    if (deletedIds.isEmpty) return;
+
+    for (final group in photoGroups) {
+      group.photos.removeWhere((p) => deletedIds.contains(p.id));
+    }
+    photoGroups.removeWhere((g) => g.photos.length <= 1);
+    notifyListeners();
+  }
 }
