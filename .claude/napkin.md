@@ -33,45 +33,22 @@ list, permission re-prompt, negative-hash grouping bug, delete not syncing the
 list (context-shadowing), isBest not re-elected after delete, silent scan-failure-
 as-success. See git log (commits `1541d84`..`805e12b`) for details on each.
 
-### 3. Opus code-review: remaining Medium/Low findings (in progress 2026-08-14)
-Full report was in-conversation only, not saved to a file. Remaining after the
-2 Critical/High items already fixed (negative-hash, delete-sync — both were
-actually promoted findings from this review):
-- Thumbnail/full-res `FutureBuilder`s re-fetch on every `build()` (not memoized),
-  so every `refreshSelection()` reflows the whole visible grid over the platform
-  channel — `photo_group_card.dart` thumbnails, `photo_fullscreen_viewer.dart` full-res.
-- Thumbnail loading state shows "broken image" instead of a spinner while
-  genuinely still loading (inverse of the fullscreen-viewer bug fixed earlier).
-- `scoring_service.dart` doesn't compile (image v3 API, project is on v4) — dead
-  code since nothing imports it, but blocks ever wiring in real best-photo scoring
-  (item 7 below). Also has a `* 255` overflow bug in `_getGrayValue` that would
-  throw `RangeError` once the compile errors are fixed.
-- Delete partial-failure: if `deletedIds` is a subset of what was requested (OS
-  partially declines), the still-present, still-selected survivor can silently
-  vanish from the list if the group drops to ≤1 remaining.
-- `groupBySimilarity` drops (not singleton-emits) a photo with no hash — output
-  isn't a partition of input; currently masked by singleton-filtering elsewhere.
-- Missing `mounted` guards after `await` in `photo_group_card.dart`'s
-  `_openFullscreen` and `permission_screen.dart`'s `_requestPermission`.
-- Missing `ValueKey`s on `PhotoGroupCard`/`_PhotoThumbnail` — per-item UI state
-  (expanded/collapsed) can follow list *index* instead of identity after a delete
-  reshuffles the list.
-- `ScanCacheService`: `clear()` isn't mutually exclusive with an in-flight
-  `flush()` (could resurrect a cleared cache); `peekSummary()` calls `load()`,
-  which would wipe in-memory progress if ever called mid-scan.
-- Resume prompt suppressed if the live library shrinks below the cached
-  `totalKnownAssets` before the next launch.
-- Narrow double-start race in `_startScan` (brief window before `isScanning`
-  flips where a second tap could start a concurrent scan).
-- Nitpick: unused `byte_formatter.dart` import in `photo_group_card.dart`,
-  write-only `_hasPermission` field in `permission_screen.dart`.
+### 3. Opus code-review: remaining Medium/Low findings ✅ ALL FIXED
+Fixed in `06ecab0` (Medium/Low bugs) + `7f65c62` (ValueKey fix bundled in).
+Verified against code 2026-08-14: FutureBuilder memoization
+(`photo_group_card.dart`'s `_thumbnailFuture`), `scoring_service.dart` v4
+API + overflow fix, `groupBySimilarity` no-hash handling, delete
+partial-failure feedback (`summary_bar.dart`), `mounted` guards, `ValueKey`s
+on `PhotoGroupCard`/`duplicate_review_screen.dart`, `ScanCacheService`
+`clear()`/`flush()` race + `peekSummary()` isolation, `_startScan`
+re-entrancy guard, and both nitpicks (unused import, write-only field) —
+all present.
 
-### 4. Fix all Cursor IDE / `flutter analyze` problems (do last, after #3)
-Sweep `flutter analyze` to zero across the whole project — currently ~20+
-`avoid_print`/`use_super_parameters`/etc. infos plus `scoring_service.dart`'s
-compile errors (see #3). Cosmetic/hygiene pass, not bug fixes — do this only
-after the Medium/Low bug list above is actually resolved, since several of
-those fixes will touch the same files anyway.
+### 4. Fix all Cursor IDE / `flutter analyze` problems ✅ DONE
+`flutter analyze` → "No issues found!" (verified 2026-08-14). Fixed in
+`d06a14e` (test/widget_test.dart rewrite, analysis_options.yaml cleanup) +
+the debugPrint sweep bundled into `06ecab0`. No `print(` calls remain
+anywhere in `lib/`.
 
 ### 5. Scoring UI Integration
 Auto-select "best" photo in each group based on real sharpness + exposure
