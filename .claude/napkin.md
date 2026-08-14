@@ -82,6 +82,33 @@ Expose configurable time window (default 120s) and Hamming distance threshold (d
 - Large-file finder
 - iOS support (untested)
 
+## Backlog: Remote Netbook Dedup (python-mvp1 extension, not the Flutter app)
+
+### 1. Run dupesweep against photos backed up on the old netbook (192.168.4.36)
+An i386 Atom N270 / 2GB RAM netbook (Python 3.6.9 only) holds a folder of
+backed-up phone photos and is reachable via SSH. It's too weak to do
+hashing/scoring/thumbnailing itself.
+- **Decided (2026-08-14)**: Transport is **SSH/SFTP only** — no server on the
+  netbook. A PC-side Python script uses `paramiko` (SFTP) to list files and
+  pull raw bytes for hashing/scoring/thumbnailing (reusing `python-mvp1`'s
+  `cluster_by_time`/`split_by_similarity`/scoring logic, run on the PC where
+  it's fast). Deletion moves files into a `_to_delete` folder on the netbook
+  via an SSH exec call (never hard-delete — same guarantee as
+  `apply_delete_list.py`), not a hard delete.
+- **Key UX change from python-mvp1**: the reviewer HTML must call delete
+  directly (fetch → local server → SSH → netbook) when a photo is marked,
+  not export a CSV for a separate `apply_delete_list.py` run later. Needs a
+  small local Flask/HTTP server on the PC (not the netbook) that the HTML's
+  JS calls at `localhost`; that server does the actual paramiko SFTP/SSH
+  work. Must be running while reviewing.
+- **Open before implementing**: netbook's backed-up-photos folder path, SSH
+  auth (key vs password — set up a key if not already), and whether this
+  lives in a new sibling folder (e.g. `python-mvp2/` or `remote-netbook/`)
+  or extends `python-mvp1/` in place.
+- **Effort**: Medium — mostly plumbing (paramiko SFTP wrapper + local Flask
+  app + reused clustering/scoring/HTML-template code); algorithm itself is
+  already validated in `python-mvp1`.
+
 ## Constraints & Gotchas
 
 **No Cloud**: This is a personal tool. Never add analytics, telemetry, or cloud sync.
