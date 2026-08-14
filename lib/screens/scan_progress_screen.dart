@@ -4,6 +4,7 @@ import '../main.dart';
 import '../models/photo_group.dart';
 import '../models/photo_item.dart';
 import '../services/photo_scanner_service.dart';
+import '../services/similarity_service.dart';
 import 'duplicate_review_screen.dart';
 
 class ScanProgressScreen extends StatefulWidget {
@@ -32,19 +33,22 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
       );
       print('[SCAN] Found ${photos.length} photos');
 
-      final withHash = photos.where((p) => p.dhash != null && p.dhash!.isNotEmpty).length;
+      final withHash =
+          photos.where((p) => p.dhash != null && p.dhash!.isNotEmpty).length;
       print('[SCAN] Computed hashes for $withHash photos');
 
       if (photos.isNotEmpty) {
-        print('[SCAN] First photo: ${photos.first.id}, hash: ${photos.first.dhash?.substring(0, 8)}...');
+        print(
+            '[SCAN] First photo: ${photos.first.id}, hash: ${photos.first.dhash?.substring(0, 8)}...');
       }
 
       if (mounted) {
-        // Group photos by day (simple time clustering for this session)
-        final groups = _groupPhotosByDay(photos);
+        // Group photos by rolling time window, then sub-group by hash similarity.
+        final groups = buildPhotoGroups(photos);
         print('[SCAN] Created ${groups.length} groups');
         for (final g in groups) {
-          print('[GROUP] ${g.id}: ${g.photos.length} photos (type: ${g.groupType})');
+          print(
+              '[GROUP] ${g.id}: ${g.photos.length} photos (type: ${g.groupType})');
         }
         provider.finishScan(groups);
 
@@ -64,99 +68,6 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
         );
       }
     }
-  }
-
-  List<PhotoGroup> _groupPhotosByDay(List<PhotoItem> photos) {
-    if (photos.isEmpty) return [];
-
-    final groups = <PhotoGroup>[];
-    int groupIndex = 0;
-    var currentDayPhotos = <PhotoItem>[photos.first];
-    var currentDay = _getDateOnly(photos.first.createDateTime);
-
-    for (int i = 1; i < photos.length; i++) {
-      final photoDay = _getDateOnly(photos[i].createDateTime);
-
-      if (photoDay == currentDay) {
-        currentDayPhotos.add(photos[i]);
-      } else {
-        // Sub-group current day's photos by hash similarity
-        _addHashGroups(groups, currentDayPhotos, currentDay, groupIndex);
-        groupIndex += currentDayPhotos.length ~/ 2 + 1; // Reserve IDs
-
-        currentDayPhotos = [photos[i]];
-        currentDay = photoDay;
-      }
-    }
-
-    // Sub-group last day's photos
-    _addHashGroups(groups, currentDayPhotos, currentDay, groupIndex);
-
-    return groups;
-  }
-
-  void _addHashGroups(
-    List<PhotoGroup> groups,
-    List<PhotoItem> dayPhotos,
-    DateTime day,
-    int startingIndex,
-  ) {
-    if (dayPhotos.isEmpty) return;
-
-    // If only one photo, add it as a single group
-    if (dayPhotos.length == 1) {
-      groups.add(PhotoGroup(
-        id: 'group_$startingIndex',
-        photos: dayPhotos,
-        timestamp: day,
-      ));
-      return;
-    }
-
-    // Group by hash similarity (Hamming distance <= 10)
-    final used = <String>{};
-    int subIndex = 0;
-
-    for (final photo in dayPhotos) {
-      if (used.contains(photo.id)) continue;
-
-      final subGroup = <PhotoItem>[photo];
-      used.add(photo.id);
-
-      if (photo.dhash != null && photo.dhash!.isNotEmpty) {
-        for (final other in dayPhotos) {
-          if (used.contains(other.id)) continue;
-          if (other.dhash == null || other.dhash!.isEmpty) continue;
-
-          final distance = _hammingDistance(photo.dhash!, other.dhash!);
-          if (distance <= 10) {
-            subGroup.add(other);
-            used.add(other.id);
-          }
-        }
-      }
-
-      groups.add(PhotoGroup(
-        id: 'group_${startingIndex}_$subIndex',
-        photos: subGroup,
-        timestamp: day,
-        groupType: subGroup.length > 1 ? 'hash' : 'single',
-      ));
-      subIndex++;
-    }
-  }
-
-  int _hammingDistance(String hash1, String hash2) {
-    if (hash1.length != hash2.length) return 999;
-    int distance = 0;
-    for (int i = 0; i < hash1.length; i++) {
-      if (hash1[i] != hash2[i]) distance++;
-    }
-    return distance;
-  }
-
-  DateTime _getDateOnly(DateTime dt) {
-    return DateTime(dt.year, dt.month, dt.day);
   }
 
   @override
@@ -232,4 +143,50 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
             ),
     );
   }
+}
+
+/// Build review groups from a sorted photo list: cluster by rolling time
+/// window via [SimilarityService.clusterByTime], then sub-group each
+/// cluster by perceptual hash similarity via
+/// [SimilarityService.groupBySimilarity]. Top-level (no State/BuildContext
+/// dependency) so it can be unit-tested directly.
+List<PhotoGroup> buildPhotoGroups(List<PhotoItem> photos) {
+  final groups = <PhotoGroup>[];
+  int groupIndex = 0;
+
+  final clusters = SimilarityService.clusterByTime(photos);
+
+  for (final cluster in clusters) {
+    if (cluster.length == 1) {
+      groups.add(PhotoGroup(
+        id: 'group_$groupIndex',
+        photos: cluster,
+        timestamp: cluster.first.createDateTime,
+      ));
+      groupIndex++;
+      continue;
+    }
+
+    final photoHashes = {
+      for (final p in cluster)
+        if (p.dhash != null && p.dhash!.isNotEmpty) p.id: p.dhash!,
+    };
+
+    final subGroups = SimilarityService.groupBySimilarity(
+      cluster,
+      photoHashes: photoHashes,
+    );
+
+    for (final subGroup in subGroups) {
+      groups.add(PhotoGroup(
+        id: 'group_$groupIndex',
+        photos: subGroup,
+        timestamp: subGroup.first.createDateTime,
+        groupType: subGroup.length > 1 ? 'hash' : 'single',
+      ));
+      groupIndex++;
+    }
+  }
+
+  return groups;
 }
