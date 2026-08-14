@@ -2,6 +2,7 @@ import 'dart:typed_data';
 import 'package:flutter/services.dart';
 import 'package:photo_manager/photo_manager.dart';
 import '../models/photo_item.dart';
+import 'scan_cache_service.dart';
 import 'similarity_service.dart';
 
 class PhotoScannerService {
@@ -11,8 +12,16 @@ class PhotoScannerService {
   /// characteristics for this use case.
   static const int _kScanConcurrency = 16;
 
+  /// [cache] is an optional save-point service. When provided:
+  ///  - already-processed assets (per `cache.cachedEntries`) are
+  ///    reconstructed from cached data instead of being re-hashed.
+  ///  - newly-processed assets are recorded into the cache and periodically
+  ///    checkpointed to disk, so an interrupted scan can resume later.
+  /// Passing `null` (the default) preserves today's behavior exactly --
+  /// no caching, useful for existing tests / simple callers.
   static Future<List<PhotoItem>> scanAllPhotos({
     Function(int, int)? onProgress,
+    ScanCacheService? cache,
   }) async {
     try {
       print('[PhotoScanner] Starting scan...');
@@ -53,6 +62,14 @@ class PhotoScannerService {
       );
 
       print('[PhotoScanner] Retrieved ${allAssets.length} assets');
+
+      if (cache != null) {
+        if (!cache.isLoaded) {
+          await cache.load();
+        }
+        cache.setTotalKnownAssets(allAssets.length);
+      }
+
       final photos = <PhotoItem>[];
       var completed = 0;
 
@@ -60,10 +77,40 @@ class PhotoScannerService {
         final chunk = allAssets.skip(i).take(_kScanConcurrency);
 
         final chunkFutures = chunk.map((asset) {
-          return _processAsset(asset).then((photo) {
+          final cached = cache?.cachedEntries[asset.id];
+          if (cached != null) {
+            // Already processed in a prior (interrupted) scan -- reconstruct
+            // without re-hashing.
+            final photo = PhotoItem(
+              id: asset.id,
+              path: asset.relativePath ?? 'Unknown',
+              createDateTime: DateTime.fromMillisecondsSinceEpoch(
+                  cached.createDateTimeMillis),
+              fileSize: cached.fileSize,
+              dhash: cached.dhash,
+            );
             photos.add(photo);
             completed++;
             onProgress?.call(completed, allAssets.length);
+            return Future.value(photo);
+          }
+
+          return _processAsset(asset).then((photo) async {
+            photos.add(photo);
+            completed++;
+            onProgress?.call(completed, allAssets.length);
+
+            cache?.recordProcessed(
+              asset.id,
+              CachedPhotoData(
+                dhash: photo.dhash,
+                createDateTimeMillis:
+                    photo.createDateTime.millisecondsSinceEpoch,
+                fileSize: photo.fileSize,
+              ),
+            );
+            await cache?.maybeCheckpoint();
+
             return photo;
           });
         });
