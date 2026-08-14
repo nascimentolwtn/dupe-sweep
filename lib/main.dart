@@ -1,10 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'models/photo_group.dart';
-import 'models/photo_item.dart';
 import 'screens/permission_screen.dart';
-import 'screens/scan_progress_screen.dart';
-import 'screens/duplicate_review_screen.dart';
 import 'theme/app_theme.dart';
 
 void main() {
@@ -12,7 +9,7 @@ void main() {
 }
 
 class DupesweepApp extends StatelessWidget {
-  const DupesweepApp({Key? key}) : super(key: key);
+  const DupesweepApp({super.key});
 
   @override
   Widget build(BuildContext context) {
@@ -73,6 +70,18 @@ class AppStateProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// One-shot signal for the review screen: after a delete removes a
+  /// group from the list, this holds the id of the group immediately
+  /// before it (in the pre-removal order) that's still around -- so
+  /// PhotoGroupCard can auto-expand that neighbor and the user picks up
+  /// right where they were reviewing instead of having to scroll back and
+  /// re-find their place after a group vanishes out from under them.
+  /// "One-shot" because PhotoGroupCard only reacts to this becoming true
+  /// on a rising edge (see its didUpdateWidget) -- it's safe to leave set
+  /// between deletes; it just won't re-trigger for the same group twice,
+  /// and the next delete overwrites it with a fresh target anyway.
+  String? pendingExpandGroupId;
+
   /// Removes successfully-deleted photos from every group, then drops any
   /// group that's left with 1 or 0 photos -- same "nothing to compare"
   /// rule the scan itself applies when first building groups, since a
@@ -84,6 +93,23 @@ class AppStateProvider extends ChangeNotifier {
     for (final group in photoGroups) {
       group.photos.removeWhere((p) => deletedIds.contains(p.id));
     }
+
+    // Walk the pre-removal order once: for every group about to disappear,
+    // remember the most recent still-surviving group seen before it. If
+    // several groups vanish in one delete, this ends up pointing at the
+    // neighbor of the last (bottom-most) one -- the closest match to
+    // "where the user was" when multiple groups are affected at once.
+    String? neighborToExpand;
+    String? lastSurvivingId;
+    for (final group in photoGroups) {
+      if (group.photos.length > 1) {
+        lastSurvivingId = group.id;
+      } else {
+        neighborToExpand = lastSurvivingId;
+      }
+    }
+    pendingExpandGroupId = neighborToExpand;
+
     photoGroups.removeWhere((g) => g.photos.length <= 1);
 
     // A surviving group may have lost its isBest photo to the delete --

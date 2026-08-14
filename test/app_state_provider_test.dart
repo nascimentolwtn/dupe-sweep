@@ -237,5 +237,94 @@ void main() {
       expect(survivors.where((p) => p.isBest).length, 1);
       expect(survivors.firstWhere((p) => p.id == 'a').isBest, isTrue);
     });
+
+    test(
+        'sets pendingExpandGroupId to the previous surviving group when a '
+        'group is removed (so the review screen can auto-expand it and '
+        'the user picks up where they were reviewing)', () {
+      final provider = AppStateProvider();
+      provider.photoGroups = [
+        PhotoGroup(
+          id: 'g1',
+          photos: [_photo('a'), _photo('b')],
+          timestamp: DateTime(2024, 1, 1),
+        ),
+        PhotoGroup(
+          id: 'g2',
+          photos: [_photo('c'), _photo('d')],
+          timestamp: DateTime(2024, 1, 1),
+        ),
+        PhotoGroup(
+          id: 'g3',
+          photos: [_photo('e'), _photo('f')],
+          timestamp: DateTime(2024, 1, 1),
+        ),
+      ];
+
+      // g2 loses one of its two photos and disappears; g1 (immediately
+      // before it) is the neighbor that should get expanded.
+      provider.removeDeletedPhotos({'c'});
+
+      expect(provider.photoGroups.map((g) => g.id), ['g1', 'g3']);
+      expect(provider.pendingExpandGroupId, 'g1');
+    });
+
+    test(
+        'pendingExpandGroupId is null when the removed group was first in '
+        'the list (no previous group to expand)', () {
+      final provider = AppStateProvider();
+      provider.photoGroups = [
+        PhotoGroup(
+          id: 'g1',
+          photos: [_photo('a'), _photo('b')],
+          timestamp: DateTime(2024, 1, 1),
+        ),
+        PhotoGroup(
+          id: 'g2',
+          photos: [_photo('c'), _photo('d')],
+          timestamp: DateTime(2024, 1, 1),
+        ),
+      ];
+
+      provider.removeDeletedPhotos({'a'});
+
+      expect(provider.photoGroups.map((g) => g.id), ['g2']);
+      expect(provider.pendingExpandGroupId, isNull);
+    });
+
+    test(
+        'pendingExpandGroupId points at the neighbor of the last removed '
+        'group when several groups disappear in one delete', () {
+      final provider = AppStateProvider();
+      provider.photoGroups = [
+        PhotoGroup(
+          id: 'g1',
+          photos: [_photo('a'), _photo('b')],
+          timestamp: DateTime(2024, 1, 1),
+        ),
+        PhotoGroup(
+          id: 'g2',
+          photos: [_photo('c'), _photo('d')],
+          timestamp: DateTime(2024, 1, 1),
+        ),
+        PhotoGroup(
+          id: 'g3',
+          photos: [_photo('e'), _photo('f')],
+          timestamp: DateTime(2024, 1, 1),
+        ),
+        PhotoGroup(
+          id: 'g4',
+          photos: [_photo('g'), _photo('h')],
+          timestamp: DateTime(2024, 1, 1),
+        ),
+      ];
+
+      // g2 and g3 both disappear; g1 is the neighbor of the last
+      // (bottom-most) one, g3.
+      provider.removeDeletedPhotos({'c', 'e'});
+
+      expect(provider.photoGroups.map((g) => g.id), ['g1', 'g4']);
+      expect(provider.pendingExpandGroupId, 'g1');
+    });
   });
 }

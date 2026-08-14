@@ -2,12 +2,11 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../main.dart';
 import '../theme/app_theme.dart';
-import '../utils/byte_formatter.dart';
 import '../widgets/photo_group_card.dart';
 import '../widgets/summary_bar.dart';
 
 class DuplicateReviewScreen extends StatefulWidget {
-  const DuplicateReviewScreen({Key? key}) : super(key: key);
+  const DuplicateReviewScreen({super.key});
 
   @override
   State<DuplicateReviewScreen> createState() => _DuplicateReviewScreenState();
@@ -71,7 +70,24 @@ class _DuplicateReviewScreenState extends State<DuplicateReviewScreen> {
                   itemCount: provider.photoGroups.length,
                   itemBuilder: (context, index) {
                     final group = provider.photoGroups[index];
-                    return PhotoGroupCard(group: group);
+                    final shouldForceExpand =
+                        group.id == provider.pendingExpandGroupId;
+                    if (shouldForceExpand) {
+                      debugPrint(
+                          '[ReviewScreen] itemBuilder: forceExpand=true for '
+                          'group ${group.id} at index $index');
+                    }
+                    // Ties this card's State (expanded/collapsed) to the
+                    // group's identity rather than its position in the
+                    // list -- without this, deleting photos out of a
+                    // group earlier in the list can make a later group
+                    // inherit the deleted one's expanded state when it
+                    // shifts into the vacated index.
+                    return PhotoGroupCard(
+                      key: ValueKey(group.id),
+                      group: group,
+                      forceExpand: shouldForceExpand,
+                    );
                   },
                 ),
               ),
