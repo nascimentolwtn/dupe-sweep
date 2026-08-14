@@ -1,30 +1,45 @@
-// This is a basic Flutter widget test.
+// Smoke test for the app's actual entry point. The stock Flutter template
+// this file started as (`MyApp` counter demo) referenced a class that
+// doesn't exist in this project and never compiled.
 //
-// To perform an interaction with a widget in your test, use the WidgetTester
-// utility in the flutter_test package. For example, you can send tap and scroll
-// gestures. You can also use WidgetTester to find child widgets in the widget
-// tree, read text, and verify that the values of widget properties are correct.
+// PermissionScreen (the app's home widget) calls Permission.photos.status
+// in initState, which goes over a platform MethodChannel -- with no real
+// Android engine in a widget test, that call needs mocking or it throws.
+// Mocking it to return "denied" exercises a real, deterministic path: the
+// initial "Grant Photo Access" screen renders instead of auto-navigating
+// away.
 
-import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 import 'package:dupesweep/main.dart';
 
 void main() {
-  testWidgets('Counter increments smoke test', (WidgetTester tester) async {
-    // Build our app and trigger a frame.
-    await tester.pumpWidget(const MyApp());
+  const permissionChannel = MethodChannel(
+    'flutter.baseflow.com/permissions/methods',
+  );
 
-    // Verify that our counter starts at 0.
-    expect(find.text('0'), findsOneWidget);
-    expect(find.text('1'), findsNothing);
+  setUp(() {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(permissionChannel, (call) async {
+      if (call.method == 'checkPermissionStatus') {
+        return 0; // PermissionStatus.denied
+      }
+      return null;
+    });
+  });
 
-    // Tap the '+' icon and trigger a frame.
-    await tester.tap(find.byIcon(Icons.add));
-    await tester.pump();
+  tearDown(() {
+    TestDefaultBinaryMessengerBinding.instance.defaultBinaryMessenger
+        .setMockMethodCallHandler(permissionChannel, null);
+  });
 
-    // Verify that our counter has incremented.
-    expect(find.text('0'), findsNothing);
-    expect(find.text('1'), findsOneWidget);
+  testWidgets('DupesweepApp launches to the Grant Photo Access screen',
+      (WidgetTester tester) async {
+    await tester.pumpWidget(const DupesweepApp());
+    await tester.pumpAndSettle();
+
+    expect(find.text('Find & Review Duplicate Photos'), findsOneWidget);
+    expect(find.text('Grant Photo Access'), findsOneWidget);
   });
 }
