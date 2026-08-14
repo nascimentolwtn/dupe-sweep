@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:photo_manager/photo_manager.dart';
 import '../models/photo_item.dart';
@@ -59,15 +60,15 @@ class PhotoScannerService {
     bool Function()? isCancelled,
   }) async {
     try {
-      print('[PhotoScanner] Starting scan...');
+      debugPrint('[PhotoScanner] Starting scan...');
 
       // Initialize background isolate for platform channels
       try {
         BackgroundIsolateBinaryMessenger.ensureInitialized(
             ServicesBinding.rootIsolateToken!);
-        print('[PhotoScanner] BackgroundIsolate initialized');
+        debugPrint('[PhotoScanner] BackgroundIsolate initialized');
       } catch (e) {
-        print(
+        debugPrint(
             '[PhotoScanner] BackgroundIsolate already initialized or main thread: $e');
       }
 
@@ -76,18 +77,18 @@ class PhotoScannerService {
         type: RequestType.image,
       );
 
-      print('[PhotoScanner] Found ${albums.length} albums');
+      debugPrint('[PhotoScanner] Found ${albums.length} albums');
       if (albums.isEmpty) {
-        print('[PhotoScanner] No albums found!');
+        debugPrint('[PhotoScanner] No albums found!');
         return [];
       }
 
       final album = albums.first;
       final assetCount = await album.assetCountAsync;
-      print('[PhotoScanner] Album has $assetCount assets');
+      debugPrint('[PhotoScanner] Album has $assetCount assets');
 
       if (assetCount == 0) {
-        print('[PhotoScanner] Album is empty!');
+        debugPrint('[PhotoScanner] Album is empty!');
         return [];
       }
 
@@ -96,7 +97,7 @@ class PhotoScannerService {
         end: assetCount,
       );
 
-      print('[PhotoScanner] Retrieved ${allAssets.length} assets');
+      debugPrint('[PhotoScanner] Retrieved ${allAssets.length} assets');
 
       if (cache != null && !cache.isLoaded) {
         await cache.load();
@@ -139,7 +140,7 @@ class PhotoScannerService {
       final candidateAssets =
           allAssets.where((a) => candidateIds.contains(a.id)).toList();
 
-      print('[PhotoScanner] ${candidateAssets.length}/${allAssets.length} '
+      debugPrint('[PhotoScanner] ${candidateAssets.length}/${allAssets.length} '
           'photos share a time cluster and need hashing '
           '(${allAssets.length - candidateAssets.length} skipped as singletons)');
 
@@ -218,8 +219,8 @@ class PhotoScannerService {
       // thumbnail, a missing asset) are already handled gracefully inside
       // _fetchMetadata/_computeHash and never reach this catch; only
       // failures affecting the scan as a whole do.
-      print('[PhotoScanner] ERROR: $e');
-      print('[PhotoScanner] StackTrace: $stackTrace');
+      debugPrint('[PhotoScanner] ERROR: $e');
+      debugPrint('[PhotoScanner] StackTrace: $stackTrace');
       rethrow;
     }
   }
@@ -228,7 +229,9 @@ class PhotoScannerService {
   /// time and file size. No thumbnail, no hash -- this is the cheap Phase 1
   /// step, always run for every photo.
   static Future<PhotoItem> _fetchMetadata(AssetEntity asset) async {
-    final createDateTime = asset.createDateTime ?? DateTime.now();
+    // createDateTime is non-nullable in the installed photo_manager
+    // version -- no `?? DateTime.now()` fallback needed or possible.
+    final createDateTime = asset.createDateTime;
 
     try {
       return PhotoItem(
@@ -238,7 +241,7 @@ class PhotoScannerService {
         fileSize: await asset.fileSize,
       );
     } catch (e) {
-      print('[PhotoScanner] Error fetching metadata for ${asset.id}: $e');
+      debugPrint('[PhotoScanner] Error fetching metadata for ${asset.id}: $e');
       return PhotoItem(
         id: asset.id,
         path: asset.relativePath ?? 'Unknown',
@@ -259,7 +262,7 @@ class PhotoScannerService {
       if (thumbData == null) return null;
       return SimilarityService.computeDHash(thumbData);
     } catch (e) {
-      print('Error computing hash for ${asset.id}: $e');
+      debugPrint('Error computing hash for ${asset.id}: $e');
       return null;
     }
   }

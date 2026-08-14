@@ -11,9 +11,9 @@ class SummaryBar extends StatelessWidget {
   final List<PhotoGroup> groups;
 
   const SummaryBar({
-    Key? key,
+    super.key,
     required this.groups,
-  }) : super(key: key);
+  });
 
   @override
   Widget build(BuildContext context) {
@@ -21,8 +21,10 @@ class SummaryBar extends StatelessWidget {
     int totalReclaimable = 0;
 
     for (final group in groups) {
-      totalSelected += group.selectedCount.toInt();
-      totalReclaimable += group.reclaimableBytes.toInt();
+      // selectedCount/reclaimableBytes are already int -- .toInt() was a
+      // no-op leftover.
+      totalSelected += group.selectedCount;
+      totalReclaimable += group.reclaimableBytes;
     }
 
     return Container(
@@ -50,7 +52,7 @@ class SummaryBar extends StatelessWidget {
         children: [
           if (totalSelected > 0) ...[
             Text(
-              'Delete ${totalSelected} photos? Reclaim ${ByteFormatter.format(totalReclaimable)}',
+              'Delete $totalSelected photos? Reclaim ${ByteFormatter.format(totalReclaimable)}',
               style: const TextStyle(
                 fontSize: 14,
                 color: AppColors.textPrimary,
@@ -132,14 +134,16 @@ class SummaryBar extends StatelessWidget {
           if (photo.isSelected) photo.id,
     ];
 
-    print('[SummaryBar] Delete requested: ${photosToDelete.length} photos');
+    debugPrint(
+        '[SummaryBar] Delete requested: ${photosToDelete.length} photos');
 
     if (photosToDelete.isEmpty) return;
 
     try {
       final deletedIds = await DeletionService.deletePhotos(photosToDelete);
 
-      print('[SummaryBar] Post-delete: context.mounted=${context.mounted}, '
+      debugPrint(
+          '[SummaryBar] Post-delete: context.mounted=${context.mounted}, '
           'deletedIds=${deletedIds.length}');
 
       if (deletedIds.isNotEmpty && context.mounted) {
@@ -149,12 +153,40 @@ class SummaryBar extends StatelessWidget {
         context
             .read<AppStateProvider>()
             .removeDeletedPhotos(deletedIds.toSet());
-        print('[SummaryBar] removeDeletedPhotos called with $deletedIds');
+        debugPrint('[SummaryBar] removeDeletedPhotos called with $deletedIds');
+      }
+
+      // On this Android version deleteWithIds is effectively all-or-
+      // nothing (one OS confirmation dialog for the whole batch), but the
+      // plugin supports older per-item delete paths too where a genuine
+      // partial result is possible -- handle it defensively either way.
+      // A photo that was requested but not confirmed deleted stays in the
+      // list (correct), but must not stay visually marked as still
+      // selected/pending, since nothing further is going to happen to it
+      // from this delete attempt.
+      final notDeleted = photosToDelete.toSet().difference(deletedIds.toSet());
+      if (notDeleted.isNotEmpty) {
+        for (final group in groups) {
+          for (final photo in group.photos) {
+            if (notDeleted.contains(photo.id)) {
+              photo.isSelected = false;
+            }
+          }
+        }
+        if (context.mounted) {
+          context.read<AppStateProvider>().refreshSelection();
+        }
       }
 
       if (context.mounted) {
+        final message = deletedIds.length == photosToDelete.length
+            ? 'Deleted ${deletedIds.length} photos'
+            : deletedIds.isEmpty
+                ? 'Delete cancelled -- no photos were deleted'
+                : 'Deleted ${deletedIds.length} of ${photosToDelete.length} '
+                    'photos';
         ScaffoldMessenger.of(context).showSnackBar(
-          SnackBar(content: Text('Deleted ${deletedIds.length} photos')),
+          SnackBar(content: Text(message)),
         );
       }
     } catch (e) {

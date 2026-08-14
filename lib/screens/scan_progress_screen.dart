@@ -13,7 +13,7 @@ import '../widgets/gradient_button.dart';
 import 'duplicate_review_screen.dart';
 
 class ScanProgressScreen extends StatefulWidget {
-  const ScanProgressScreen({Key? key}) : super(key: key);
+  const ScanProgressScreen({super.key});
 
   @override
   State<ScanProgressScreen> createState() => _ScanProgressScreenState();
@@ -32,6 +32,13 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
   bool _checkingResume = true;
   bool _cancelled = false;
   bool _cancelling = false;
+  // Set synchronously as the very first thing _startScan does, before any
+  // `await`. provider.isScanning isn't enough on its own to prevent a
+  // double-start: it only flips true partway through _startScan (after
+  // `await _cache.clear()` on the start-over path), so a second tap
+  // landing in that gap would see isScanning still false and start a
+  // second concurrent scan sharing the same _cache/_stopwatch/_tickTimer.
+  bool _isStarting = false;
 
   @override
   void initState() {
@@ -96,18 +103,18 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
   Future<void> _checkForResume() async {
     final summary = await _cache.peekSummary();
 
-    // A save point that's already complete (nothing left to resume)
-    // shouldn't normally be reachable -- a completed scan clears its own
-    // cache -- but treat it defensively the same as "no save point".
-    final usable = (summary != null &&
-            summary.totalKnownAssets > 0 &&
-            summary.processedCount < summary.totalKnownAssets)
-        ? summary
-        : null;
-
+    // peekSummary() already returns null for a genuinely empty/nonexistent
+    // cache, so its non-null result alone means real cached work exists.
+    // This used to additionally require processedCount < totalKnownAssets
+    // as a "not already complete" safety net -- but totalKnownAssets is
+    // just whatever candidate count the interrupted run last stored, and
+    // if the live photo library shrinks afterward (the user deletes
+    // photos before relaunching), a stale/smaller totalKnownAssets could
+    // make that comparison false and silently suppress a perfectly usable
+    // resume offer, discarding real completed hashing work for no reason.
     if (!mounted) return;
     setState(() {
-      _resumeSummary = usable;
+      _resumeSummary = summary;
       _checkingResume = false;
     });
   }
@@ -140,6 +147,16 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
   }
 
   Future<void> _startScan({bool resume = true}) async {
+    if (_isStarting) return;
+    _isStarting = true;
+    try {
+      await _startScanInner(resume: resume);
+    } finally {
+      _isStarting = false;
+    }
+  }
+
+  Future<void> _startScanInner({required bool resume}) async {
     final provider = context.read<AppStateProvider>();
 
     if (!resume) {
@@ -167,14 +184,14 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
           provider.updateProgress(current / total, '$phase: $current/$total');
         },
       );
-      print('[SCAN] Found ${photos.length} photos');
+      debugPrint('[SCAN] Found ${photos.length} photos');
 
       final withHash =
           photos.where((p) => p.dhash != null && p.dhash!.isNotEmpty).length;
-      print('[SCAN] Computed hashes for $withHash photos');
+      debugPrint('[SCAN] Computed hashes for $withHash photos');
 
       if (photos.isNotEmpty) {
-        print(
+        debugPrint(
             '[SCAN] First photo: ${photos.first.id}, hash: ${photos.first.dhash?.substring(0, 8)}...');
       }
 
@@ -185,9 +202,9 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
       if (mounted) {
         // Group photos by rolling time window, then sub-group by hash similarity.
         final groups = buildPhotoGroups(photos);
-        print('[SCAN] Created ${groups.length} groups');
+        debugPrint('[SCAN] Created ${groups.length} groups');
         for (final g in groups) {
-          print(
+          debugPrint(
               '[GROUP] ${g.id}: ${g.photos.length} photos (type: ${g.groupType})');
         }
         provider.finishScan(groups);
@@ -206,7 +223,7 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
         }
       }
     } on ScanCancelledException {
-      print('[SCAN] Cancelled by user');
+      debugPrint('[SCAN] Cancelled by user');
       provider.cancelScan();
       _stopTiming();
       // The scanner already flushed the cache before throwing, so re-check
@@ -222,7 +239,7 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
         );
       }
     } catch (e) {
-      print('Error during scan: $e');
+      debugPrint('Error during scan: $e');
       provider.cancelScan();
       _stopTiming();
       // scanAllPhotos now rethrows instead of swallowing real failures, so

@@ -1,4 +1,4 @@
-import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 import 'package:image/image.dart' as img;
 import '../models/photo_item.dart';
 
@@ -75,7 +75,7 @@ class SimilarityService {
             '0',
           );
     } catch (e) {
-      print('Error computing dHash: $e');
+      debugPrint('Error computing dHash: $e');
       return '';
     }
   }
@@ -131,17 +131,25 @@ class SimilarityService {
       used.add(photo.id);
       final photoHash = photoHashes[photo.id] ?? '';
 
-      if (photoHash.isEmpty) continue;
+      // A photo with no hash (a thumbnail fetch that failed, etc.) can't
+      // be compared to anything, but it must still come out the other end
+      // as its own singleton group -- `continue`-ing straight past
+      // `groups.add(group)` below (the previous behavior) silently
+      // dropped it from the output entirely, so the function's result
+      // wasn't a partition of its input. Today that's masked by
+      // buildPhotoGroups filtering singletons anyway, but a photo that
+      // fails to hash would otherwise be unreviewable with zero feedback.
+      if (photoHash.isNotEmpty) {
+        for (final other in photos) {
+          if (used.contains(other.id)) continue;
 
-      for (final other in photos) {
-        if (used.contains(other.id)) continue;
+          final otherHash = photoHashes[other.id] ?? '';
+          if (otherHash.isEmpty) continue;
 
-        final otherHash = photoHashes[other.id] ?? '';
-        if (otherHash.isEmpty) continue;
-
-        if (hammingDistance(photoHash, otherHash) <= hammingThreshold) {
-          group.add(other);
-          used.add(other.id);
+          if (hammingDistance(photoHash, otherHash) <= hammingThreshold) {
+            group.add(other);
+            used.add(other.id);
+          }
         }
       }
 

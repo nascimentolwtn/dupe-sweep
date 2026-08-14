@@ -1,6 +1,7 @@
 import 'dart:convert';
 import 'dart:io';
 
+import 'package:flutter/foundation.dart';
 import 'package:path_provider/path_provider.dart';
 
 /// Schema version for the on-disk scan cache. Bumped only if the entry
@@ -100,8 +101,12 @@ class ScanCacheService {
   /// work and by resume-summary UI).
   Map<String, CachedPhotoData> get cachedEntries => Map.unmodifiable(_entries);
 
-  /// Whether [load] has already been called on this instance. Callers that
-  /// already loaded (e.g. via [peekSummary]) can skip a redundant reload.
+  /// Whether [load] (or [clear]) has already been called on this instance.
+  /// Callers that already loaded can skip a redundant reload. Note
+  /// [peekSummary] does NOT set this -- it reads the cache file directly
+  /// without touching any instance state, specifically so it's safe to
+  /// call at any time (e.g. to show a resume prompt) without risk of
+  /// clobbering a scan that's concurrently using this same instance.
   bool get isLoaded => _loaded;
 
   int get totalKnownAssets => _totalKnownAssets;
@@ -135,24 +140,29 @@ class ScanCacheService {
 
     try {
       final file = await _cacheFile();
-      if (!await file.exists()) return;
+      // The analyzer's avoid_slow_async_io suggests the sync File API here,
+      // but this runs on the main isolate during app startup/scan-resume
+      // checks -- sync file I/O would block the UI thread instead. Async
+      // is the correct choice for a mobile app despite the lint; ignored
+      // throughout this file for that reason, not fixed the suggested way.
+      if (!await file.exists()) return; // ignore: avoid_slow_async_io
 
       final contents = await file.readAsString();
       final decoded = jsonDecode(contents);
       if (decoded is! Map<String, dynamic>) {
-        print('[ScanCache] Cache file is not a JSON object, ignoring.');
+        debugPrint('[ScanCache] Cache file is not a JSON object, ignoring.');
         return;
       }
 
       final version = decoded['version'];
       if (version != _kScanCacheVersion) {
-        print('[ScanCache] Cache version mismatch ($version), ignoring.');
+        debugPrint('[ScanCache] Cache version mismatch ($version), ignoring.');
         return;
       }
 
       final entries = decoded['entries'];
       if (entries is! Map<String, dynamic>) {
-        print('[ScanCache] Cache entries missing/invalid, ignoring.');
+        debugPrint('[ScanCache] Cache entries missing/invalid, ignoring.');
         return;
       }
 
@@ -162,7 +172,7 @@ class ScanCacheService {
         try {
           _entries[entry.key] = CachedPhotoData.fromJson(value);
         } catch (e) {
-          print('[ScanCache] Skipping malformed entry ${entry.key}: $e');
+          debugPrint('[ScanCache] Skipping malformed entry ${entry.key}: $e');
         }
       }
 
@@ -170,9 +180,9 @@ class ScanCacheService {
           (decoded['totalKnownAssets'] as int?) ?? _entries.length;
       _updatedAtMillis = (decoded['updatedAtMillis'] as int?) ?? 0;
 
-      print('[ScanCache] Loaded ${_entries.length} cached entries.');
+      debugPrint('[ScanCache] Loaded ${_entries.length} cached entries.');
     } catch (e) {
-      print('[ScanCache] Failed to load cache, starting fresh: $e');
+      debugPrint('[ScanCache] Failed to load cache, starting fresh: $e');
       _entries.clear();
       _totalKnownAssets = 0;
       _updatedAtMillis = 0;
@@ -238,6 +248,7 @@ class ScanCacheService {
 
     try {
       final dir = await _resolveDirectory();
+      // ignore: avoid_slow_async_io
       if (!await dir.exists()) {
         await dir.create(recursive: true);
       }
@@ -251,7 +262,7 @@ class ScanCacheService {
       _entriesSinceLastFlush = 0;
       _lastFlushTime = DateTime.now();
     } catch (e) {
-      print('[ScanCache] Failed to write cache checkpoint: $e');
+      debugPrint('[ScanCache] Failed to write cache checkpoint: $e');
     }
   }
 
@@ -259,6 +270,13 @@ class ScanCacheService {
   /// "Start over" and by successful scan completion -- a finished scan
   /// shouldn't leave behind a "resume" prompt next launch.
   Future<void> clear() async {
+    // Wait for any in-flight flush to finish first. Without this, a
+    // flush() already in progress can still rename its temp file into
+    // place AFTER the delete below runs, resurrecting a cache the caller
+    // just explicitly asked to clear (e.g. showing a stale "Resume scan"
+    // prompt for a scan the user just started over from).
+    await _inFlightFlush;
+
     _entries.clear();
     _totalKnownAssets = 0;
     _updatedAtMillis = 0;
@@ -268,29 +286,51 @@ class ScanCacheService {
 
     try {
       final file = await _cacheFile();
+      // ignore: avoid_slow_async_io
       if (await file.exists()) {
         await file.delete();
       }
       final tempFile = await _tempFile();
+      // ignore: avoid_slow_async_io
       if (await tempFile.exists()) {
         await tempFile.delete();
       }
     } catch (e) {
-      print('[ScanCache] Failed to delete cache file: $e');
+      debugPrint('[ScanCache] Failed to delete cache file: $e');
     }
   }
 
   /// Cheap read for the UI resume prompt. Returns `null` if no usable cache
-  /// exists. Reuses [load] internally -- reading a few thousand small JSON
-  /// entries is fast, no need for a separate lightweight parse path unless
-  /// profiling later says otherwise.
+  /// exists. Deliberately does NOT call [load] or touch any instance state
+  /// (`_entries`, `_loaded`, etc.) -- it used to, which meant calling this
+  /// while a scan was concurrently using the same `ScanCacheService`
+  /// instance could wipe that scan's in-memory progress out from under it.
+  /// This reads and parses the file directly instead, entirely
+  /// independent of whatever this instance's own state currently is.
   Future<ScanCacheSummary?> peekSummary() async {
-    await load();
-    if (_entries.isEmpty) return null;
-    return ScanCacheSummary(
-      processedCount: _entries.length,
-      totalKnownAssets: _totalKnownAssets,
-      updatedAtMillis: _updatedAtMillis,
-    );
+    try {
+      final file = await _cacheFile();
+      if (!await file.exists()) return null; // ignore: avoid_slow_async_io
+
+      final contents = await file.readAsString();
+      final decoded = jsonDecode(contents);
+      if (decoded is! Map<String, dynamic>) return null;
+
+      final version = decoded['version'];
+      if (version != _kScanCacheVersion) return null;
+
+      final entries = decoded['entries'];
+      if (entries is! Map<String, dynamic> || entries.isEmpty) return null;
+
+      return ScanCacheSummary(
+        processedCount: entries.length,
+        totalKnownAssets:
+            (decoded['totalKnownAssets'] as int?) ?? entries.length,
+        updatedAtMillis: (decoded['updatedAtMillis'] as int?) ?? 0,
+      );
+    } catch (e) {
+      debugPrint('[ScanCache] Failed to peek cache summary: $e');
+      return null;
+    }
   }
 }

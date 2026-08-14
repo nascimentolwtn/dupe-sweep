@@ -8,7 +8,7 @@ import '../models/photo_item.dart';
 import '../theme/app_theme.dart';
 
 /// Fullscreen, swipeable photo viewer for comparing the photos within a
-/// single [PhotoGroup] side by side (one at a time) at full resolution --
+/// single group side by side (one at a time) at full resolution --
 /// mirrors the lightbox in `python-mvp1/build_review_html.py` (prev/next
 /// navigation, a "mark for deletion" checkbox that stays in sync with the
 /// grid view, both readable at a glance while zoomed in on detail).
@@ -35,11 +35,24 @@ class _PhotoFullscreenViewerState extends State<PhotoFullscreenViewer> {
   late final PageController _pageController;
   late int _currentIndex;
 
+  // Keyed by photo id, populated lazily via putIfAbsent in _fileFutureFor:
+  // PageView.builder calls itemBuilder fresh on every rebuild (e.g. every
+  // _toggleSelected -> setState/refreshSelection), and building the
+  // FutureBuilder's `future:` argument inline there would re-issue a full-
+  // resolution file read from disk each time -- this cache makes each
+  // page's file only ever get loaded once, no matter how many times the
+  // page rebuilds around it.
+  final Map<String, Future<File?>> _fileFutures = {};
+
   @override
   void initState() {
     super.initState();
     _currentIndex = widget.initialIndex;
     _pageController = PageController(initialPage: widget.initialIndex);
+  }
+
+  Future<File?> _fileFutureFor(PhotoItem photo) {
+    return _fileFutures.putIfAbsent(photo.id, () => _loadFile(photo));
   }
 
   @override
@@ -88,7 +101,7 @@ class _PhotoFullscreenViewerState extends State<PhotoFullscreenViewer> {
                   maxScale: 4.0,
                   child: Center(
                     child: FutureBuilder<File?>(
-                      future: _loadFile(p),
+                      future: _fileFutureFor(p),
                       builder: (context, snapshot) {
                         // These are two different states, not one: "still
                         // waiting" must keep spinning, but "finished with
@@ -255,7 +268,8 @@ class _PhotoFullscreenViewerState extends State<PhotoFullscreenViewer> {
       final asset = await AssetEntity.fromId(photo.id);
       return await asset?.file;
     } catch (e) {
-      print('[PhotoFullscreenViewer] Error loading file for ${photo.id}: $e');
+      debugPrint(
+          '[PhotoFullscreenViewer] Error loading file for ${photo.id}: $e');
       return null;
     }
   }

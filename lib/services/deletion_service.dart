@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:photo_manager/photo_manager.dart';
 
 class DeletionService {
@@ -12,15 +13,15 @@ class DeletionService {
   static Future<List<String>> deletePhotos(List<String> photoIds) async {
     if (photoIds.isEmpty) return [];
 
-    print('[DeletionService] Requesting delete of ${photoIds.length} '
+    debugPrint('[DeletionService] Requesting delete of ${photoIds.length} '
         'photos: $photoIds');
     try {
       final result = await PhotoManager.editor.deleteWithIds(photoIds);
-      print('[DeletionService] OS confirmed deletion of ${result.length}/'
+      debugPrint('[DeletionService] OS confirmed deletion of ${result.length}/'
           '${photoIds.length} photos: $result');
       return result;
     } catch (e) {
-      print('[DeletionService] Error deleting photos: $e');
+      debugPrint('[DeletionService] Error deleting photos: $e');
       return [];
     }
   }
@@ -31,7 +32,7 @@ class DeletionService {
       final result = await PhotoManager.editor.deleteWithIds([photoId]);
       return result.isNotEmpty;
     } catch (e) {
-      print('Error deleting photo $photoId: $e');
+      debugPrint('Error deleting photo $photoId: $e');
       return false;
     }
   }

@@ -1,4 +1,4 @@
-import 'dart:typed_data';
+import 'package:flutter/foundation.dart';
 import 'package:image/image.dart' as img;
 import '../models/photo_item.dart';
 
@@ -44,7 +44,7 @@ class ScoringService {
       final normalizedVariance = variance / 100000.0;
       return (normalizedVariance > 1.0) ? 1.0 : normalizedVariance;
     } catch (e) {
-      print('Error computing sharpness: $e');
+      debugPrint('Error computing sharpness: $e');
       return 0.0;
     }
   }
@@ -92,7 +92,7 @@ class ScoringService {
 
       return exposureScore.clamp(0.0, 1.0);
     } catch (e) {
-      print('Error computing exposure: $e');
+      debugPrint('Error computing exposure: $e');
       return 0.5;
     }
   }
@@ -108,10 +108,20 @@ class ScoringService {
     return ranked;
   }
 
-  static int _getGrayValue(int pixel) {
-    final r = img.getRed(pixel);
-    final g = img.getGreen(pixel);
-    final b = img.getBlue(pixel);
-    return ((0.299 * r + 0.587 * g + 0.114 * b) * 255).toInt();
+  // Takes the image package's Pixel type (what getPixelSafe actually
+  // returns as of image v4 -- this project's dependency version, not the
+  // v3 this file was originally written against) rather than a raw int,
+  // and reads channel values via the .r/.g/.b properties instead of the
+  // removed getRed/getGreen/getBlue free functions.
+  static int _getGrayValue(img.Pixel pixel) {
+    final r = pixel.r.toInt();
+    final g = pixel.g.toInt();
+    final b = pixel.b.toInt();
+    // r/g/b are already 0-255 (the image was already converted to
+    // grayscale before this is called), so the weighted sum is already in
+    // 0-255 range -- multiplying by 255 again (the original code) would
+    // overflow histogram[value] far past its 256-slot bounds and throw
+    // RangeError on the very first non-black pixel.
+    return (0.299 * r + 0.587 * g + 0.114 * b).toInt();
   }
 }

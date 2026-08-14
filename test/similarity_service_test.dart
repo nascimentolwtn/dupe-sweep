@@ -306,7 +306,12 @@ void main() {
         expect(groups[1].length, 1);
       });
 
-      test('handles photos with no hash', () {
+      test(
+          'a photo with no hash still comes out as its own singleton group '
+          '(regression: previously `continue`-d straight past groups.add, '
+          'silently dropping it from the output entirely -- the result '
+          'must be a partition of the input, every photo in exactly one '
+          'group, not "every photo that happened to have a hash")', () {
         final photos = [
           PhotoItem(
             id: '1',
@@ -330,7 +335,14 @@ void main() {
           photoHashes: hashes,
         );
 
-        expect(groups.length, 1);
+        expect(groups.length, 2);
+        expect(
+          groups.map((g) => g.map((p) => p.id).toSet()),
+          containsAll([
+            {'1'},
+            {'2'},
+          ]),
+        );
       });
 
       test('empty photo list returns empty groups', () {

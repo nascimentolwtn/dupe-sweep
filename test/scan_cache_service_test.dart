@@ -154,7 +154,7 @@ void main() {
         everyDuration: const Duration(minutes: 5),
       );
 
-      expect(await file.exists(), isFalse);
+      expect(file.existsSync(), isFalse);
     });
 
     test('maybeCheckpoint writes once the count threshold is crossed',
@@ -174,7 +174,7 @@ void main() {
         everyDuration: const Duration(minutes: 5),
       );
 
-      expect(await file.exists(), isTrue);
+      expect(file.existsSync(), isTrue);
     });
 
     test('maybeCheckpoint writes once the duration threshold elapses',
@@ -193,7 +193,7 @@ void main() {
         everyDuration: const Duration(milliseconds: 10),
       );
 
-      expect(await file.exists(), isTrue);
+      expect(file.existsSync(), isTrue);
     });
 
     test(
@@ -235,11 +235,11 @@ void main() {
       await service.flush();
 
       final file = File('${tempDir.path}/scan_cache.json');
-      expect(await file.exists(), isTrue);
+      expect(file.existsSync(), isTrue);
 
       await service.clear();
 
-      expect(await file.exists(), isFalse);
+      expect(file.existsSync(), isFalse);
       expect(service.cachedEntries, isEmpty);
     });
 

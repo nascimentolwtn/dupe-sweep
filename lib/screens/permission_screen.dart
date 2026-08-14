@@ -5,14 +5,13 @@ import '../widgets/gradient_button.dart';
 import 'scan_progress_screen.dart';
 
 class PermissionScreen extends StatefulWidget {
-  const PermissionScreen({Key? key}) : super(key: key);
+  const PermissionScreen({super.key});
 
   @override
   State<PermissionScreen> createState() => _PermissionScreenState();
 }
 
 class _PermissionScreenState extends State<PermissionScreen> {
-  bool _hasPermission = false;
   bool _checking = true;
 
   @override
@@ -37,7 +36,6 @@ class _PermissionScreenState extends State<PermissionScreen> {
 
     if (mounted) {
       setState(() {
-        _hasPermission = status.isGranted;
         _checking = false;
       });
     }
@@ -45,9 +43,11 @@ class _PermissionScreenState extends State<PermissionScreen> {
 
   Future<void> _requestPermission() async {
     final status = await Permission.photos.request();
-    setState(() {
-      _hasPermission = status.isGranted;
-    });
+    // Missing here previously (present on every other branch in this
+    // method and in _checkPermission): backing out of the app while the
+    // system permission dialog is showing, then returning, could hit this
+    // setState after the widget was disposed.
+    if (!mounted) return;
 
     if (status.isGranted || status.isLimited) {
       if (mounted) {
