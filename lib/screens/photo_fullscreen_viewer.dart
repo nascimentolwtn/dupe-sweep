@@ -1,0 +1,281 @@
+import 'dart:io';
+
+import 'package:flutter/material.dart';
+import 'package:photo_manager/photo_manager.dart';
+import 'package:provider/provider.dart';
+import '../main.dart';
+import '../models/photo_item.dart';
+import '../theme/app_theme.dart';
+
+/// Fullscreen, swipeable photo viewer for comparing the photos within a
+/// single [PhotoGroup] side by side (one at a time) at full resolution --
+/// mirrors the lightbox in `python-mvp1/build_review_html.py` (prev/next
+/// navigation, a "mark for deletion" checkbox that stays in sync with the
+/// grid view, both readable at a glance while zoomed in on detail).
+///
+/// [photos] is the SAME list (and same [PhotoItem] instances) the calling
+/// `PhotoGroupCard` holds, so toggling the checkbox here mutates the shared
+/// objects directly -- the card picks up the change via its own `setState`
+/// after this screen is popped, no separate sync step needed.
+class PhotoFullscreenViewer extends StatefulWidget {
+  final List<PhotoItem> photos;
+  final int initialIndex;
+
+  const PhotoFullscreenViewer({
+    super.key,
+    required this.photos,
+    required this.initialIndex,
+  });
+
+  @override
+  State<PhotoFullscreenViewer> createState() => _PhotoFullscreenViewerState();
+}
+
+class _PhotoFullscreenViewerState extends State<PhotoFullscreenViewer> {
+  late final PageController _pageController;
+  late int _currentIndex;
+
+  @override
+  void initState() {
+    super.initState();
+    _currentIndex = widget.initialIndex;
+    _pageController = PageController(initialPage: widget.initialIndex);
+  }
+
+  @override
+  void dispose() {
+    _pageController.dispose();
+    super.dispose();
+  }
+
+  void _goTo(int index) {
+    _pageController.animateToPage(
+      index,
+      duration: const Duration(milliseconds: 200),
+      curve: Curves.easeOut,
+    );
+  }
+
+  void _toggleSelected() {
+    setState(() {
+      final photo = widget.photos[_currentIndex];
+      photo.isSelected = !photo.isSelected;
+    });
+    // SummaryBar (a sibling of the review screen's group list, not an
+    // ancestor of this viewer) only rebuilds off AppStateProvider, not off
+    // direct PhotoItem mutation -- without this it'd show a stale count
+    // when returning from a selection made here.
+    context.read<AppStateProvider>().refreshSelection();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final photo = widget.photos[_currentIndex];
+
+    return Scaffold(
+      backgroundColor: Colors.black,
+      body: SafeArea(
+        child: Stack(
+          children: [
+            PageView.builder(
+              controller: _pageController,
+              itemCount: widget.photos.length,
+              onPageChanged: (index) => setState(() => _currentIndex = index),
+              itemBuilder: (context, index) {
+                final p = widget.photos[index];
+                return InteractiveViewer(
+                  minScale: 1.0,
+                  maxScale: 4.0,
+                  child: Center(
+                    child: FutureBuilder<File?>(
+                      future: _loadFile(p),
+                      builder: (context, snapshot) {
+                        // These are two different states, not one: "still
+                        // waiting" must keep spinning, but "finished with
+                        // no file" (deleted/missing asset) previously hit
+                        // this same spinner branch and never left it --
+                        // the fullscreen view for an already-deleted photo
+                        // spun forever instead of showing an error.
+                        if (snapshot.connectionState != ConnectionState.done) {
+                          return const CircularProgressIndicator(
+                            color: Colors.white,
+                          );
+                        }
+                        if (snapshot.data == null) {
+                          return const Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Icon(
+                                Icons.broken_image,
+                                color: Colors.white54,
+                                size: 64,
+                              ),
+                              SizedBox(height: 12),
+                              Text(
+                                'Photo no longer available',
+                                style: TextStyle(color: Colors.white54),
+                              ),
+                            ],
+                          );
+                        }
+                        return Image.file(
+                          snapshot.data!,
+                          fit: BoxFit.contain,
+                        );
+                      },
+                    ),
+                  ),
+                );
+              },
+            ),
+
+            // Top bar: close + position counter.
+            Positioned(
+              top: 8,
+              left: 8,
+              right: 8,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  _RoundIconButton(
+                    icon: Icons.close,
+                    onPressed: () => Navigator.of(context).pop(),
+                  ),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 12,
+                      vertical: 6,
+                    ),
+                    decoration: BoxDecoration(
+                      color: Colors.black54,
+                      borderRadius: BorderRadius.circular(16),
+                    ),
+                    child: Text(
+                      '${_currentIndex + 1}/${widget.photos.length}',
+                      style: const TextStyle(color: Colors.white),
+                    ),
+                  ),
+                  if (photo.isBest)
+                    Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 4,
+                      ),
+                      decoration: BoxDecoration(
+                        color: AppColors.accentBest,
+                        borderRadius: BorderRadius.circular(4),
+                      ),
+                      child: const Text(
+                        'BEST',
+                        style: TextStyle(
+                          color: AppColors.bgTop,
+                          fontSize: 11,
+                          fontWeight: FontWeight.bold,
+                        ),
+                      ),
+                    )
+                  else
+                    const SizedBox(width: 48),
+                ],
+              ),
+            ),
+
+            // Prev/next navigation arrows.
+            if (_currentIndex > 0)
+              Positioned(
+                left: 8,
+                top: 0,
+                bottom: 0,
+                child: Center(
+                  child: _RoundIconButton(
+                    icon: Icons.chevron_left,
+                    onPressed: () => _goTo(_currentIndex - 1),
+                  ),
+                ),
+              ),
+            if (_currentIndex < widget.photos.length - 1)
+              Positioned(
+                right: 8,
+                top: 0,
+                bottom: 0,
+                child: Center(
+                  child: _RoundIconButton(
+                    icon: Icons.chevron_right,
+                    onPressed: () => _goTo(_currentIndex + 1),
+                  ),
+                ),
+              ),
+
+            // Bottom bar: mark-for-deletion checkbox, toggleable from here.
+            Positioned(
+              left: 0,
+              right: 0,
+              bottom: 16,
+              child: Center(
+                child: Material(
+                  color: Colors.black54,
+                  borderRadius: BorderRadius.circular(24),
+                  child: InkWell(
+                    borderRadius: BorderRadius.circular(24),
+                    onTap: _toggleSelected,
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 16,
+                        vertical: 10,
+                      ),
+                      child: Row(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                          Icon(
+                            photo.isSelected
+                                ? Icons.check_box
+                                : Icons.check_box_outline_blank,
+                            color: Colors.white,
+                          ),
+                          const SizedBox(width: 8),
+                          const Text(
+                            'Mark for deletion',
+                            style: TextStyle(color: Colors.white),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Future<File?> _loadFile(PhotoItem photo) async {
+    try {
+      final asset = await AssetEntity.fromId(photo.id);
+      return await asset?.file;
+    } catch (e) {
+      print('[PhotoFullscreenViewer] Error loading file for ${photo.id}: $e');
+      return null;
+    }
+  }
+}
+
+class _RoundIconButton extends StatelessWidget {
+  final IconData icon;
+  final VoidCallback onPressed;
+
+  const _RoundIconButton({required this.icon, required this.onPressed});
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.black45,
+      shape: const CircleBorder(),
+      child: IconButton(
+        icon: Icon(icon, color: Colors.white),
+        onPressed: onPressed,
+      ),
+    );
+  }
+}
