@@ -27,55 +27,94 @@ Integrate dHash (already computed in SimilarityService) into the review UI.
 - **Status**: COMPLETE - Scanning, hashing, and sub-grouping all working
 - **Implementation**: PhotoScannerService computes hashes during scan, ScanProgressScreen shows progress, groups use hash-based sub-clustering
 
-### 2. Fix grouping so it matches python-mvp1 behavior (real-device bug)
-Android is not matching similar shots by near date-time the way `python-mvp1/find_duplicate_photos.py` does.
-- **Root cause**: `ScanProgressScreen._groupPhotosByDay` (`lib/screens/scan_progress_screen.dart:69-96`) buckets photos by **calendar day** (midnight-to-midnight), not by a rolling time gap. Two photos 2 minutes apart at 23:59/00:01 land in different groups; a whole day's photos get hash-compared against each other regardless of how many hours apart they were taken. `python-mvp1` uses `cluster_by_time` (gap ≤120s between consecutive sorted shots, see `find_duplicate_photos.py:120-131`), and so does the existing (but unused) `SimilarityService.clusterByTime` (`lib/services/similarity_service.dart:11-34`) — it's just never called.
-- **Also**: `scan_progress_screen.dart` has its own inline copy of hash-grouping (`_addHashGroups`, `_hammingDistance`) duplicating `SimilarityService.groupBySimilarity`/`hammingDistance` — two implementations that can silently drift.
-- **Also**: Dart's dHash (gradient-based, `similarity_service.dart:38-66`) is a different algorithm from Python's `imagehash.phash` (DCT-based) — thresholds of "10" mean different things in each; not necessarily a bug to fix now, but worth noting if match quality is still off after the time-window fix.
-- **Impact**: This is the core value prop of the app (finding bursts/duplicates) — currently broken relative to the validated reference implementation.
-- **Effort**: Medium — replace `_groupPhotosByDay` with `SimilarityService.clusterByTime` + `groupBySimilarity`, delete the duplicate inline logic.
+### 2. Real-device bugs from 2026-08-13/14 session ✅ ALL FIXED
+Grouping-vs-python-mvp1 mismatch, ~20min scan time, no save points, hard-to-scroll
+list, permission re-prompt, negative-hash grouping bug, delete not syncing the
+list (context-shadowing), isBest not re-elected after delete, silent scan-failure-
+as-success. See git log (commits `1541d84`..`805e12b`) for details on each.
 
-### 3. Scan takes ~20min for ~7k photos on Samsung S22FE (real-device bug)
-- **Root cause**: `PhotoScannerService.scanAllPhotos` (`lib/services/photo_scanner_service.dart:50-76`) awaits `thumbnailDataWithSize` + `fileSize` + dHash **sequentially, one photo at a time**, on the main thread (isolate was removed in commit "Fix isolate blocker by running scan on main thread"). Each iteration is a platform-channel round trip; nothing overlaps.
-- **Reference**: `python-mvp1` uses a `ThreadPoolExecutor(max_workers=16)` for the equivalent I/O-bound hash pass (`find_duplicate_photos.py:204-227`), which is the actual reason it's fast.
-- **Impact**: Core scan flow is nearly unusable on a real ~7k-photo library.
-- **Effort**: Medium — batch with `Future.wait` (chunks of N concurrent `thumbnailDataWithSize` calls) instead of one-by-one; re-investigate why the isolate approach broke (platform channel init) since isolate + batching together would be ideal, but batching alone on main thread is the minimum fix.
+### 3. Opus code-review: remaining Medium/Low findings (in progress 2026-08-14)
+Full report was in-conversation only, not saved to a file. Remaining after the
+2 Critical/High items already fixed (negative-hash, delete-sync — both were
+actually promoted findings from this review):
+- Thumbnail/full-res `FutureBuilder`s re-fetch on every `build()` (not memoized),
+  so every `refreshSelection()` reflows the whole visible grid over the platform
+  channel — `photo_group_card.dart` thumbnails, `photo_fullscreen_viewer.dart` full-res.
+- Thumbnail loading state shows "broken image" instead of a spinner while
+  genuinely still loading (inverse of the fullscreen-viewer bug fixed earlier).
+- `scoring_service.dart` doesn't compile (image v3 API, project is on v4) — dead
+  code since nothing imports it, but blocks ever wiring in real best-photo scoring
+  (item 7 below). Also has a `* 255` overflow bug in `_getGrayValue` that would
+  throw `RangeError` once the compile errors are fixed.
+- Delete partial-failure: if `deletedIds` is a subset of what was requested (OS
+  partially declines), the still-present, still-selected survivor can silently
+  vanish from the list if the group drops to ≤1 remaining.
+- `groupBySimilarity` drops (not singleton-emits) a photo with no hash — output
+  isn't a partition of input; currently masked by singleton-filtering elsewhere.
+- Missing `mounted` guards after `await` in `photo_group_card.dart`'s
+  `_openFullscreen` and `permission_screen.dart`'s `_requestPermission`.
+- Missing `ValueKey`s on `PhotoGroupCard`/`_PhotoThumbnail` — per-item UI state
+  (expanded/collapsed) can follow list *index* instead of identity after a delete
+  reshuffles the list.
+- `ScanCacheService`: `clear()` isn't mutually exclusive with an in-flight
+  `flush()` (could resurrect a cleared cache); `peekSummary()` calls `load()`,
+  which would wipe in-memory progress if ever called mid-scan.
+- Resume prompt suppressed if the live library shrinks below the cached
+  `totalKnownAssets` before the next launch.
+- Narrow double-start race in `_startScan` (brief window before `isScanning`
+  flips where a second tap could start a concurrent scan).
+- Nitpick: unused `byte_formatter.dart` import in `photo_group_card.dart`,
+  write-only `_hasPermission` field in `permission_screen.dart`.
 
-### 4. Scan save points / pause & resume (real-device follow-up to #3)
-If scan speed can't be fully fixed, let the user pause and resume a scan instead of losing all progress on interruption (backgrounding, crash, accidental back-nav).
-- **Reference**: `python-mvp1` persists `hash_cache.json` incrementally every 100 files and is fully resumable by re-running the same command (`find_duplicate_photos.py:189-243`) — same pattern applies here.
-- **Impact**: At current ~20min scan times, any interruption currently means starting over from photo 0.
-- **Effort**: Medium — persist `{asset.id: {dhash, createDateTime, fileSize}}` to local storage (e.g. `shared_preferences` or a simple JSON file) periodically during scan; on next launch, skip already-scanned asset IDs and offer "Resume scan (N/M done)" vs "Start over."
-- **Depends on**: Should land after #3 (batching) so the save/resume checkpoint cadence is designed around the new scan loop shape, not the old sequential one.
+### 4. Fix all Cursor IDE / `flutter analyze` problems (do last, after #3)
+Sweep `flutter analyze` to zero across the whole project — currently ~20+
+`avoid_print`/`use_super_parameters`/etc. infos plus `scoring_service.dart`'s
+compile errors (see #3). Cosmetic/hygiene pass, not bug fixes — do this only
+after the Medium/Low bug list above is actually resolved, since several of
+those fixes will touch the same files anyway.
 
-### 5. Review screen is hard to scroll (real-device bug)
-- **Root cause**: `DuplicateReviewScreen` (`lib/screens/duplicate_review_screen.dart:51-58`) wraps groups in a bare `ListView.builder` with no `Scrollbar`. With hundreds of groups from a 7k-photo library, there's no visible/draggable scroll handle — only inertial flick-scrolling.
-- **Impact**: Makes review painful/slow on large libraries, compounds the performance complaint.
-- **Effort**: Low — wrap in `Scrollbar(thumbVisibility: true, trackVisibility: true, interactive: true, child: ListView.builder(...))` so there's a touchable/draggable thumb on the right edge.
+### 5. Scoring UI Integration
+Auto-select "best" photo in each group based on real sharpness + exposure
+scoring instead of the current largest-file-size stopgap (`PhotoGroup.
+ensureBestElected`).
+- **Impact**: More accurate default pick than file size alone.
+- **Blocked on**: `scoring_service.dart` needs the image v4 API fix (item 3) first.
+- **Effort**: Low once unblocked — call scoring during Phase 2, feed into
+  `ensureBestElected`'s selection instead of file size.
 
-### 6. "Grant permission" screen reappears every app start (real-device bug)
-- **Root cause**: `PermissionScreen._checkPermission` (`lib/screens/permission_screen.dart:21-26`) checks `Permission.photos.status` in `initState` but only updates local `_hasPermission` state — it never auto-navigates to `ScanProgressScreen` when permission is already granted. Since `main.dart:28` always sets `PermissionScreen` as `home`, the user sees the "Grant Photo Access" screen/button on every launch even when access was already granted previously.
-- **Impact**: Adds a pointless extra tap on every single app open.
-- **Effort**: Low — in `_checkPermission`, if `status.isGranted`, navigate to `ScanProgressScreen` immediately (mirroring the navigation already done in `_requestPermission`).
-
-### 7. Scoring UI Integration
-Auto-select "best" photo in each group based on sharpness + exposure scoring.
-- **Impact**: Reduces manual selection burden for bursts
-- **Status**: ScoringService computes scores but review screen ignores them
-- **Effort**: Low—add `isBest` flag to PhotoItem, update UI to highlight/preselect, respect scoring in delete workflow
-
-### 8. Settings Screen
+### 6. Settings Screen
 Expose configurable time window (default 120s) and Hamming distance threshold (default 10).
 - **Impact**: Lets power users fine-tune grouping behavior
 - **Effort**: Medium—add new screen, wire to state management, persist to SharedPreferences
 
-### 9. UI Polish (Lower Priority)
-- Dark mode
-- Better styling / Material 3 refinement
-- Animations (card expand/collapse, delete confirmation)
+### 7. Persist the review list across app restarts (requested 2026-08-14)
+Currently `AppStateProvider.photoGroups` is pure in-memory state -- closing
+the app loses the built review list entirely, forcing a full re-scan next
+launch even though nothing changed. `ScanCacheService`'s save-points only
+cover an *in-progress* scan's hashing work, not the *finished* grouped
+result.
+- **Wanted flow**: after a scan completes (and after every delete, so the
+  saved copy never goes stale/points at deleted photos), persist the
+  current `photoGroups` (+ selection state) to disk. On next launch, if a
+  saved list exists, offer to resume reviewing it directly -- skip
+  scanning entirely -- with a "Full rescan" button always available for
+  when the user wants a fresh scan instead.
+- **Design notes for whoever picks this up**: reuse the `ScanCacheService`
+  JSON-file pattern (temp-file-then-rename, version field) rather than
+  inventing a second mechanism; needs to store `PhotoGroup.id`/`groupType`/
+  timestamp plus each `PhotoItem`'s id/fileSize/dhash/isBest/isSelected --
+  everything `buildPhotoGroups` doesn't need to be recomputed from scratch.
+  Write on `finishScan` and on every `removeDeletedPhotos` call (both
+  already funnel through `AppStateProvider`, so both are natural save
+  points). `main.dart`'s entry point (`PermissionScreen` -> auto-navigate)
+  would need a new fork: saved review list exists -> go straight to
+  `DuplicateReviewScreen`; otherwise -> `ScanProgressScreen` as today.
+- **Effort**: Medium -- mostly plumbing similar to the existing scan-cache
+  save points, plus one new decision point in the permission->home routing.
 
-### 10. Advanced Features (Phase 2+, Do Not Start Yet)
-- Re-scan flow (merge with previous results)
+### 8. Advanced Features (Phase 2+, Do Not Start Yet)
+- Re-scan flow (merge with previous results) — NOTE: basic Re-scan button now
+  exists (full rescan, not a merge) as of 2026-08-14
 - WhatsApp media scoping
 - Blurry photo detector
 - Cache/junk cleaner
@@ -108,6 +147,26 @@ hashing/scoring/thumbnailing itself.
 - **Effort**: Medium — mostly plumbing (paramiko SFTP wrapper + local Flask
   app + reused clustering/scoring/HTML-template code); algorithm itself is
   already validated in `python-mvp1`.
+
+### 2. Archive-move mode: sync_data → archive on the netbook (frees phone storage)
+Netbook paths: `/media/backup/sync_data` (live sync target from phone) →
+`/media/backup/archive` (stable, not touched by the sync tool). Moving
+photos out of the actively-synced tree before deleting them from the phone
+protects the archived copy from a two-way sync tool cleaning it up — same
+class of risk already flagged in `python-mvp1/README_MVP1.md`'s "Known
+constraint learned the hard way".
+- **Decided (2026-08-14)**: same-disk `sftp.rename` (netbook→netbook, no
+  bytes cross the network — near-instant even on the weak Atom). New mode
+  in `serve_review.py` (not a separate script) — reuses the `/browse`
+  folder picker to choose a `sync_data` subfolder, adds an optional
+  date-range filter (by file mtime, no EXIF parsing needed, keeps this
+  feature Pillow-free), skips anything modified in the last few minutes
+  (mid-sync guard), preserves subfolder structure under `archive/`.
+- **Depends on**: `remote_client.py`/`serve_review.py` from
+  `.claude/plans/remote-netbook-dedup.md` (not yet built). Full plan:
+  `.claude/plans/archive-remote-photos.md`.
+- **Effort**: Low-Medium — mostly a recursive same-disk move + folder-picker
+  UI reuse; no hashing/scoring/thumbnailing involved at all.
 
 ## Constraints & Gotchas
 
