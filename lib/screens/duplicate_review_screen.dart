@@ -13,6 +13,14 @@ class DuplicateReviewScreen extends StatefulWidget {
 }
 
 class _DuplicateReviewScreenState extends State<DuplicateReviewScreen> {
+  final ScrollController _scrollController = ScrollController();
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -48,13 +56,20 @@ class _DuplicateReviewScreenState extends State<DuplicateReviewScreen> {
 
           return Stack(
             children: [
-              ListView.builder(
-                padding: const EdgeInsets.only(bottom: 100),
-                itemCount: provider.photoGroups.length,
-                itemBuilder: (context, index) {
-                  final group = provider.photoGroups[index];
-                  return PhotoGroupCard(group: group);
-                },
+              Scrollbar(
+                controller: _scrollController,
+                thumbVisibility: true,
+                trackVisibility: true,
+                interactive: true,
+                child: ListView.builder(
+                  controller: _scrollController,
+                  padding: const EdgeInsets.only(bottom: 100),
+                  itemCount: provider.photoGroups.length,
+                  itemBuilder: (context, index) {
+                    final group = provider.photoGroups[index];
+                    return PhotoGroupCard(group: group);
+                  },
+                ),
               ),
               Positioned(
                 bottom: 0,
