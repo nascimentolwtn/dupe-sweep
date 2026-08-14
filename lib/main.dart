@@ -54,5 +54,11 @@ class AppStateProvider extends ChangeNotifier {
     isScanning = false;
     notifyListeners();
   }
-}
 
+  /// User-initiated cancel: stop showing the scanning UI without setting
+  /// `photoGroups`, since no grouping was ever computed for a cancelled run.
+  void cancelScan() {
+    isScanning = false;
+    notifyListeners();
+  }
+}

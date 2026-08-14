@@ -19,6 +19,8 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
   final ScanCacheService _cache = ScanCacheService();
   ScanCacheSummary? _resumeSummary;
   bool _checkingResume = true;
+  bool _cancelled = false;
+  bool _cancelling = false;
 
   @override
   void initState() {
@@ -84,14 +86,19 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
       }
     }
 
+    setState(() {
+      _cancelled = false;
+      _cancelling = false;
+    });
     provider.startScan();
 
     try {
       // Run scan on main thread to avoid isolate platform channel issues
       final photos = await PhotoScannerService.scanAllPhotos(
         cache: _cache,
-        onProgress: (current, total) {
-          provider.updateProgress(current / total, 'Scanning: $current/$total');
+        isCancelled: () => _cancelled,
+        onProgress: (current, total, phase) {
+          provider.updateProgress(current / total, '$phase: $current/$total');
         },
       );
       print('[SCAN] Found ${photos.length} photos');
@@ -131,14 +138,41 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
           );
         }
       }
+    } on ScanCancelledException {
+      print('[SCAN] Cancelled by user');
+      provider.cancelScan();
+      // The scanner already flushed the cache before throwing, so re-check
+      // for a resumable save point rather than assuming none exists.
+      await _checkForResume();
+      if (mounted) {
+        setState(() {
+          _cancelled = false;
+          _cancelling = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Scan cancelled')),
+        );
+      }
     } catch (e) {
       print('Error during scan: $e');
+      provider.cancelScan();
       if (mounted) {
+        setState(() {
+          _cancelled = false;
+          _cancelling = false;
+        });
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(content: Text('Scan error: $e')),
         );
       }
     }
+  }
+
+  void _cancelScan() {
+    setState(() {
+      _cancelled = true;
+      _cancelling = true;
+    });
   }
 
   @override
@@ -169,6 +203,12 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
                   Text(
                     '${(provider.scanProgress * 100).toStringAsFixed(1)}%',
                     style: const TextStyle(color: Colors.grey),
+                  ),
+                  const SizedBox(height: 24),
+                  TextButton.icon(
+                    onPressed: _cancelling ? null : _cancelScan,
+                    icon: const Icon(Icons.close),
+                    label: Text(_cancelling ? 'Cancelling...' : 'Cancel'),
                   ),
                 ],
               ),
@@ -251,6 +291,12 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
 /// cluster by perceptual hash similarity via
 /// [SimilarityService.groupBySimilarity]. Top-level (no State/BuildContext
 /// dependency) so it can be unit-tested directly.
+///
+/// Clusters/sub-groups of exactly one photo are dropped: there's nothing to
+/// compare a lone photo against, so it can never be a "which one do I keep"
+/// decision for the review screen -- matching `python-mvp1`'s reference
+/// behavior (`cluster_by_time`/`split_by_similarity` both filter to
+/// `len > 1`), which the Dart port had drifted from.
 List<PhotoGroup> buildPhotoGroups(List<PhotoItem> photos) {
   final groups = <PhotoGroup>[];
   int groupIndex = 0;
@@ -258,15 +304,7 @@ List<PhotoGroup> buildPhotoGroups(List<PhotoItem> photos) {
   final clusters = SimilarityService.clusterByTime(photos);
 
   for (final cluster in clusters) {
-    if (cluster.length == 1) {
-      groups.add(PhotoGroup(
-        id: 'group_$groupIndex',
-        photos: cluster,
-        timestamp: cluster.first.createDateTime,
-      ));
-      groupIndex++;
-      continue;
-    }
+    if (cluster.length == 1) continue;
 
     final photoHashes = {
       for (final p in cluster)
@@ -279,11 +317,24 @@ List<PhotoGroup> buildPhotoGroups(List<PhotoItem> photos) {
     );
 
     for (final subGroup in subGroups) {
+      if (subGroup.length == 1) continue;
+
+      // Stopgap "best" pick: largest file size, already fetched for every
+      // photo during Phase 1 metadata, zero extra cost. Without marking
+      // *some* photo isBest, `PhotoGroup.selectAllNonBest()` (the "Select
+      // All Non-Best" button) selects literally every photo in the group,
+      // including the one you'd want to keep -- real sharpness/exposure
+      // scoring (`ScoringService`, already implemented but not wired into
+      // the scan pipeline) is the proper fix and remains a separate
+      // backlog item; this only prevents the dangerous "select everything"
+      // behavior in the meantime.
+      subGroup.reduce((a, b) => b.fileSize > a.fileSize ? b : a).isBest = true;
+
       groups.add(PhotoGroup(
         id: 'group_$groupIndex',
         photos: subGroup,
         timestamp: subGroup.first.createDateTime,
-        groupType: subGroup.length > 1 ? 'hash' : 'single',
+        groupType: 'hash',
       ));
       groupIndex++;
     }
