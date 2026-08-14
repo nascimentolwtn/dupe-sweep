@@ -1,3 +1,5 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../main.dart';
@@ -6,6 +8,8 @@ import '../models/photo_item.dart';
 import '../services/photo_scanner_service.dart';
 import '../services/scan_cache_service.dart';
 import '../services/similarity_service.dart';
+import '../theme/app_theme.dart';
+import '../widgets/gradient_button.dart';
 import 'duplicate_review_screen.dart';
 
 class ScanProgressScreen extends StatefulWidget {
@@ -17,6 +21,13 @@ class ScanProgressScreen extends StatefulWidget {
 
 class _ScanProgressScreenState extends State<ScanProgressScreen> {
   final ScanCacheService _cache = ScanCacheService();
+  final Stopwatch _stopwatch = Stopwatch();
+  Timer? _tickTimer;
+  // Snapshot of scan progress, refreshed twice a second by _tickTimer
+  // rather than on every scan callback (which can fire many times a
+  // second) -- keeps the elapsed/remaining-time estimate updating at a
+  // steady cadence instead of jittering with every processed photo.
+  double _progressForEstimate = 0.0;
   ScanCacheSummary? _resumeSummary;
   bool _checkingResume = true;
   bool _cancelled = false;
@@ -26,6 +37,60 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
   void initState() {
     super.initState();
     _checkForResume();
+  }
+
+  @override
+  void dispose() {
+    _tickTimer?.cancel();
+    super.dispose();
+  }
+
+  void _startTiming() {
+    _stopwatch
+      ..reset()
+      ..start();
+    _progressForEstimate = 0.0;
+    _tickTimer?.cancel();
+    _tickTimer = Timer.periodic(const Duration(milliseconds: 500), (_) {
+      if (!mounted) return;
+      setState(() {
+        _progressForEstimate = context.read<AppStateProvider>().scanProgress;
+      });
+    });
+  }
+
+  void _stopTiming() {
+    _stopwatch.stop();
+    _tickTimer?.cancel();
+    _tickTimer = null;
+  }
+
+  String _formatDuration(Duration d) {
+    final totalSeconds = d.inSeconds;
+    final h = totalSeconds ~/ 3600;
+    final m = (totalSeconds % 3600) ~/ 60;
+    final s = totalSeconds % 60;
+    if (h > 0) {
+      return '$h:${m.toString().padLeft(2, '0')}:${s.toString().padLeft(2, '0')}';
+    }
+    return '$m:${s.toString().padLeft(2, '0')}';
+  }
+
+  /// Elapsed time plus a rough remaining-time estimate extrapolated from
+  /// elapsed/progress. Needs a couple seconds of real progress before the
+  /// extrapolation is stable enough to show.
+  String _elapsedAndEstimateLabel(double progress) {
+    final elapsed = _stopwatch.elapsed;
+    final elapsedStr = _formatDuration(elapsed);
+    if (progress <= 0.02 || elapsed.inSeconds < 2) {
+      return 'Elapsed $elapsedStr · Estimating time remaining…';
+    }
+    final totalEstimate = elapsed * (1 / progress);
+    final remaining = totalEstimate - elapsed;
+    if (remaining.isNegative) {
+      return 'Elapsed $elapsedStr';
+    }
+    return 'Elapsed $elapsedStr · About ${_formatDuration(remaining)} remaining';
   }
 
   Future<void> _checkForResume() async {
@@ -91,6 +156,7 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
       _cancelling = false;
     });
     provider.startScan();
+    _startTiming();
 
     try {
       // Run scan on main thread to avoid isolate platform channel issues
@@ -125,6 +191,7 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
               '[GROUP] ${g.id}: ${g.photos.length} photos (type: ${g.groupType})');
         }
         provider.finishScan(groups);
+        _stopTiming();
 
         // A finished scan shouldn't leave behind a "resume" prompt next
         // launch -- the cache only bridges an interrupted scan.
@@ -141,6 +208,7 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
     } on ScanCancelledException {
       print('[SCAN] Cancelled by user');
       provider.cancelScan();
+      _stopTiming();
       // The scanner already flushed the cache before throwing, so re-check
       // for a resumable save point rather than assuming none exists.
       await _checkForResume();
@@ -156,6 +224,7 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
     } catch (e) {
       print('Error during scan: $e');
       provider.cancelScan();
+      _stopTiming();
       if (mounted) {
         setState(() {
           _cancelled = false;
@@ -193,16 +262,31 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
                   const SizedBox(height: 24),
                   Text(
                     provider.scanStatus ?? 'Scanning...',
-                    style: const TextStyle(fontSize: 16),
+                    style: const TextStyle(
+                      fontSize: 16,
+                      color: AppColors.textPrimary,
+                    ),
                   ),
                   const SizedBox(height: 16),
-                  LinearProgressIndicator(
-                    value: provider.scanProgress,
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(4),
+                    child: LinearProgressIndicator(
+                      value: provider.scanProgress,
+                      minHeight: 6,
+                    ),
                   ),
                   const SizedBox(height: 8),
                   Text(
                     '${(provider.scanProgress * 100).toStringAsFixed(1)}%',
-                    style: const TextStyle(color: Colors.grey),
+                    style: const TextStyle(color: AppColors.textSecondary),
+                  ),
+                  const SizedBox(height: 4),
+                  Text(
+                    _elapsedAndEstimateLabel(_progressForEstimate),
+                    style: const TextStyle(
+                      color: AppColors.textSecondary,
+                      fontSize: 12,
+                    ),
                   ),
                   const SizedBox(height: 24),
                   TextButton.icon(
@@ -218,10 +302,14 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
               child: Column(
                 mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  const Icon(
-                    Icons.photo_library,
-                    size: 64,
-                    color: Colors.blue,
+                  ShaderMask(
+                    shaderCallback: (bounds) =>
+                        AppColors.accentGradient.createShader(bounds),
+                    child: const Icon(
+                      Icons.diamond_outlined,
+                      size: 64,
+                      color: Colors.white,
+                    ),
                   ),
                   const SizedBox(height: 24),
                   const Text(
@@ -229,6 +317,7 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
                     style: TextStyle(
                       fontSize: 24,
                       fontWeight: FontWeight.bold,
+                      color: AppColors.textPrimary,
                     ),
                   ),
                   const SizedBox(height: 16),
@@ -238,7 +327,10 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
                             'where it left off or start over.'
                         : 'Tap the button below to scan your photo library for duplicates.',
                     textAlign: TextAlign.center,
-                    style: const TextStyle(fontSize: 16, color: Colors.grey),
+                    style: const TextStyle(
+                      fontSize: 16,
+                      color: AppColors.textSecondary,
+                    ),
                   ),
                   const SizedBox(height: 32),
                   if (_checkingResume)
@@ -248,19 +340,11 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
                       child: CircularProgressIndicator(strokeWidth: 2),
                     )
                   else if (_resumeSummary != null) ...[
-                    ElevatedButton.icon(
+                    GradientButton(
                       onPressed: () => _startScan(resume: true),
-                      icon: const Icon(Icons.play_arrow),
-                      label: Text(
-                        'Resume scan (${_resumeSummary!.processedCount}/'
-                        '${_resumeSummary!.totalKnownAssets} done)',
-                      ),
-                      style: ElevatedButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 32,
-                          vertical: 16,
-                        ),
-                      ),
+                      icon: Icons.play_arrow,
+                      label: 'Resume scan (${_resumeSummary!.processedCount}/'
+                          '${_resumeSummary!.totalKnownAssets} done)',
                     ),
                     const SizedBox(height: 12),
                     TextButton(
@@ -268,16 +352,10 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
                       child: const Text('Start over'),
                     ),
                   ] else
-                    ElevatedButton.icon(
+                    GradientButton(
                       onPressed: () => _startScan(),
-                      icon: const Icon(Icons.search),
-                      label: const Text('Start Scan'),
-                      style: ElevatedButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 32,
-                          vertical: 16,
-                        ),
-                      ),
+                      icon: Icons.search,
+                      label: 'Start Scan',
                     ),
                 ],
               ),
