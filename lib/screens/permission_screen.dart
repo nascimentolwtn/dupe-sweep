@@ -11,6 +11,7 @@ class PermissionScreen extends StatefulWidget {
 
 class _PermissionScreenState extends State<PermissionScreen> {
   bool _hasPermission = false;
+  bool _checking = true;
 
   @override
   void initState() {
@@ -20,9 +21,24 @@ class _PermissionScreenState extends State<PermissionScreen> {
 
   Future<void> _checkPermission() async {
     final status = await Permission.photos.status;
-    setState(() {
-      _hasPermission = status.isGranted;
-    });
+
+    if (status.isGranted || status.isLimited) {
+      if (mounted) {
+        Navigator.of(context).pushReplacement(
+          MaterialPageRoute(
+            builder: (_) => const ScanProgressScreen(),
+          ),
+        );
+      }
+      return;
+    }
+
+    if (mounted) {
+      setState(() {
+        _hasPermission = status.isGranted;
+        _checking = false;
+      });
+    }
   }
 
   Future<void> _requestPermission() async {
@@ -31,7 +47,7 @@ class _PermissionScreenState extends State<PermissionScreen> {
       _hasPermission = status.isGranted;
     });
 
-    if (status.isGranted) {
+    if (status.isGranted || status.isLimited) {
       if (mounted) {
         Navigator.of(context).pushReplacement(
           MaterialPageRoute(
@@ -54,6 +70,14 @@ class _PermissionScreenState extends State<PermissionScreen> {
 
   @override
   Widget build(BuildContext context) {
+    if (_checking) {
+      return const Scaffold(
+        body: Center(
+          child: CircularProgressIndicator(),
+        ),
+      );
+    }
+
     return Scaffold(
       appBar: AppBar(
         title: const Text('DupeSweep'),
