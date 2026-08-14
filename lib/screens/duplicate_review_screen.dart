@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../main.dart';
+import '../theme/app_theme.dart';
 import '../utils/byte_formatter.dart';
 import '../widgets/photo_group_card.dart';
 import '../widgets/summary_bar.dart';
@@ -37,17 +38,20 @@ class _DuplicateReviewScreenState extends State<DuplicateReviewScreen> {
                   Icon(
                     Icons.check_circle,
                     size: 64,
-                    color: Colors.green,
+                    color: AppColors.accentBest,
                   ),
                   SizedBox(height: 16),
                   Text(
                     'No duplicates found',
-                    style: TextStyle(fontSize: 18),
+                    style: TextStyle(
+                      fontSize: 18,
+                      color: AppColors.textPrimary,
+                    ),
                   ),
                   SizedBox(height: 8),
                   Text(
                     'Your photos look unique!',
-                    style: TextStyle(color: Colors.grey),
+                    style: TextStyle(color: AppColors.textSecondary),
                   ),
                 ],
               ),

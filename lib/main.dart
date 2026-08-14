@@ -5,6 +5,7 @@ import 'models/photo_item.dart';
 import 'screens/permission_screen.dart';
 import 'screens/scan_progress_screen.dart';
 import 'screens/duplicate_review_screen.dart';
+import 'theme/app_theme.dart';
 
 void main() {
   runApp(const DupesweepApp());
@@ -21,10 +22,7 @@ class DupesweepApp extends StatelessWidget {
       ],
       child: MaterialApp(
         title: 'DupeSweep',
-        theme: ThemeData(
-          primarySwatch: Colors.blue,
-          useMaterial3: true,
-        ),
+        theme: buildAppTheme(),
         home: const PermissionScreen(),
       ),
     );

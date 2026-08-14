@@ -1,5 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
+import '../theme/app_theme.dart';
+import '../widgets/gradient_button.dart';
 import 'scan_progress_screen.dart';
 
 class PermissionScreen extends StatefulWidget {
@@ -87,10 +89,14 @@ class _PermissionScreenState extends State<PermissionScreen> {
         child: Column(
           mainAxisAlignment: MainAxisAlignment.center,
           children: [
-            const Icon(
-              Icons.photo_library,
-              size: 64,
-              color: Colors.blue,
+            ShaderMask(
+              shaderCallback: (bounds) =>
+                  AppColors.accentGradient.createShader(bounds),
+              child: const Icon(
+                Icons.diamond_outlined,
+                size: 64,
+                color: Colors.white,
+              ),
             ),
             const SizedBox(height: 24),
             const Text(
@@ -98,31 +104,26 @@ class _PermissionScreenState extends State<PermissionScreen> {
               style: TextStyle(
                 fontSize: 24,
                 fontWeight: FontWeight.bold,
+                color: AppColors.textPrimary,
               ),
             ),
             const SizedBox(height: 16),
             const Text(
               'DupeSweep scans your phone\'s photos to find potential duplicates and burst shots. You control which photos to delete.',
               textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 16, color: Colors.grey),
+              style: TextStyle(fontSize: 16, color: AppColors.textSecondary),
             ),
             const SizedBox(height: 32),
-            ElevatedButton.icon(
+            GradientButton(
               onPressed: _requestPermission,
-              icon: const Icon(Icons.check),
-              label: const Text('Grant Photo Access'),
-              style: ElevatedButton.styleFrom(
-                padding: const EdgeInsets.symmetric(
-                  horizontal: 32,
-                  vertical: 16,
-                ),
-              ),
+              icon: Icons.check,
+              label: 'Grant Photo Access',
             ),
             const SizedBox(height: 16),
             const Text(
               'This permission is needed to scan and delete photos on your device.',
               textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 12, color: Colors.grey),
+              style: TextStyle(fontSize: 12, color: AppColors.textSecondary),
             ),
           ],
         ),
