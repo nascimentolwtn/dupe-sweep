@@ -58,7 +58,22 @@ class SimilarityService {
         }
       }
 
-      return hash.toRadixString(16).padLeft(16, '0');
+      // `hash` is a plain (signed 64-bit) Dart int built via 64 left-shifts,
+      // so whichever comparison lands in the top bit position can make it
+      // negative -- and `int.toRadixString` on a negative value returns a
+      // MINUS-SIGN-PREFIXED string of its magnitude (e.g. "-555555555555556"),
+      // not a two's-complement unsigned hex string. That corrupted string
+      // then parses back as a negative BigInt in hammingDistance, whose XOR
+      // against a positive hash is negative, and `while (xor > BigInt.zero)`
+      // exits immediately -- silently reporting distance 0 ("identical")
+      // for unrelated photos, for roughly half of all possible hash values.
+      // toUnsigned(64) reinterprets the same bit pattern as an unsigned
+      // 64-bit value before formatting, which is what every consumer
+      // (hammingDistance, the cache, the UI) actually expects.
+      return BigInt.from(hash).toUnsigned(64).toRadixString(16).padLeft(
+            16,
+            '0',
+          );
     } catch (e) {
       print('Error computing dHash: $e');
       return '';
@@ -135,5 +150,4 @@ class SimilarityService {
 
     return groups;
   }
-
 }

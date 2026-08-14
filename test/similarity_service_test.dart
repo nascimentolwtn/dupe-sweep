@@ -84,6 +84,30 @@ void main() {
 
         expect(hash, '0000000000000000');
       });
+
+      test(
+          'never returns a sign-prefixed hash, even when the top bit is set '
+          '(regression: hash is built as a signed 64-bit int via 64 '
+          'left-shifts, so whichever comparison lands in the sign-bit '
+          'position made toRadixString emit "-<magnitude>" instead of an '
+          'unsigned hex string -- e.g. "-555555555555556" instead of '
+          '"aaaaaaaaaaaaaaaa". A descending gradient (first pixel brighter '
+          'than the second) sets exactly that bit.)', () {
+        final descending =
+            _syntheticPng(16, 16, (x, y) => ((15 - x) * 16) % 256);
+
+        final hash = SimilarityService.computeDHash(descending);
+
+        expect(
+          RegExp(r'^[0-9a-f]{16}$').hasMatch(hash),
+          isTrue,
+          reason: 'got "$hash", which is not clean unsigned hex',
+        );
+        // The corrupted string previously broke hammingDistance's own
+        // BigInt.parse (a negative parse), which made a hash NOT match
+        // itself -- self-comparison must always be 0.
+        expect(SimilarityService.hammingDistance(hash, hash), 0);
+      });
     });
 
     group('clusterByTime', () {
