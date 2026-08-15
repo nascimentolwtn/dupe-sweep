@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'models/photo_group.dart';
+import 'models/photo_item.dart';
 import 'screens/permission_screen.dart';
 import 'services/review_cache_service.dart';
 import 'theme/app_theme.dart';
@@ -51,9 +52,41 @@ class AppStateProvider extends ChangeNotifier {
   double scanProgress = 0.0;
   String? scanStatus;
 
+  // Flat, independently-flagged results for the large-file finder (napkin
+  // backlog #8) -- deliberately NOT PhotoGroups: there's no "keep the best,
+  // delete the rest" comparison for these, each photo/video is judged on
+  // its own. Not persisted via ReviewCacheService like photoGroups -- these
+  // scans are cheap enough (metadata-only, see LargeFileScanService) that
+  // resuming across app restarts isn't worth the added complexity.
+  List<PhotoItem> largeFiles = [];
+
+  void finishLargeFileScan(List<PhotoItem> photos) {
+    largeFiles = photos;
+    isScanning = false;
+    notifyListeners();
+  }
+
+  // Flat, independently-flagged results for the blurry-photo detector
+  // (napkin backlog #8) -- same "no best-photo comparison" shape as
+  // [largeFiles], and likewise not persisted across restarts.
+  List<PhotoItem> blurryPhotos = [];
+
+  void finishBlurScan(List<PhotoItem> photos) {
+    blurryPhotos = photos;
+    isScanning = false;
+    notifyListeners();
+  }
+
   void startScan() {
     isScanning = true;
     scanProgress = 0.0;
+    // Without this, the scanning screen briefly shows the PREVIOUS scan's
+    // last status text (e.g. "Checking for duplicates: 450/450") until the
+    // new scan's first onProgress callback fires -- confusing, since those
+    // numbers have nothing to do with the scan that just started. Falls
+    // back to ScanProgressScreen's generic "Scanning..." label until real
+    // progress comes in.
+    scanStatus = null;
     notifyListeners();
   }
 

@@ -6,7 +6,7 @@ import '../services/review_cache_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/gradient_button.dart';
 import 'duplicate_review_screen.dart';
-import 'scan_progress_screen.dart';
+import 'home_screen.dart';
 
 class PermissionScreen extends StatefulWidget {
   const PermissionScreen({super.key});
@@ -61,14 +61,20 @@ class _PermissionScreenState extends State<PermissionScreen> {
     } else {
       Navigator.of(context).pushReplacement(
         MaterialPageRoute(
-          builder: (_) => const ScanProgressScreen(),
+          builder: (_) => const HomeScreen(),
         ),
       );
     }
   }
 
   Future<void> _requestPermission() async {
-    final status = await Permission.photos.request();
+    // Requested together: `Permission.videos` is only needed for the
+    // large-file finder (napkin backlog #8) to see video assets alongside
+    // photos, but `Permission.photos` remains the gate for the rest of the
+    // app -- a denied `Permission.videos` just means large-file results
+    // won't include videos, not that the whole permission flow fails.
+    final statuses = await [Permission.photos, Permission.videos].request();
+    final status = statuses[Permission.photos] ?? PermissionStatus.denied;
     // Missing here previously (present on every other branch in this
     // method and in _checkPermission): backing out of the app while the
     // system permission dialog is showing, then returning, could hit this

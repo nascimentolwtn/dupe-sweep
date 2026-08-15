@@ -6,6 +6,7 @@ import '../main.dart';
 import '../models/photo_group.dart';
 import '../models/photo_item.dart';
 import '../screens/photo_fullscreen_viewer.dart';
+import '../screens/photo_slider_compare_screen.dart';
 import '../theme/app_theme.dart';
 
 class PhotoGroupCard extends StatefulWidget {
@@ -29,8 +30,26 @@ class PhotoGroupCard extends StatefulWidget {
   State<PhotoGroupCard> createState() => _PhotoGroupCardState();
 }
 
-class _PhotoGroupCardState extends State<PhotoGroupCard> {
+class _PhotoGroupCardState extends State<PhotoGroupCard>
+    with AutomaticKeepAliveClientMixin<PhotoGroupCard> {
   late bool _isExpanded = widget.forceExpand;
+
+  // Transient "compare" pair-staging: the first photo the user checks the
+  // compare-checkbox on in this card, waiting for a second check to open
+  // PhotoSliderCompareScreen with both. Scoped to this card's own State
+  // (not AppStateProvider) -- it's pure UI staging, not review data, and
+  // resets naturally when the card is rebuilt/collapsed.
+  PhotoItem? _stagedForCompare;
+
+  // Keeps this card's State (in particular _isExpanded) alive even when
+  // ListView.builder's virtualization would otherwise dispose it after
+  // scrolling far off-screen -- without this, fast scrolling made expanded
+  // groups appear to randomly re-collapse when scrolled back into view,
+  // since a freshly-rebuilt State always starts from forceExpand (usually
+  // false). Only keeping ALIVE cards expanded (not every card, always)
+  // keeps the cost bounded to whatever the user actually has open.
+  @override
+  bool get wantKeepAlive => _isExpanded;
 
   @override
   void didUpdateWidget(covariant PhotoGroupCard oldWidget) {
@@ -40,8 +59,49 @@ class _PhotoGroupCardState extends State<PhotoGroupCard> {
     }
   }
 
+  void _handleCompareCheckboxTap(PhotoItem photo) {
+    final staged = _stagedForCompare;
+    if (staged == null) {
+      setState(() => _stagedForCompare = photo);
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('Select another photo to compare')),
+      );
+      return;
+    }
+    if (staged.id == photo.id) {
+      // Tapping the already-staged photo's checkbox again clears it.
+      setState(() => _stagedForCompare = null);
+      return;
+    }
+    setState(() => _stagedForCompare = null);
+
+    // Left/right is assigned by the photos' order WITHIN THE GROUP, not by
+    // which one the user happened to check first -- so the comparison
+    // always reads left-to-right the same way the thumbnail row does,
+    // regardless of tap order.
+    final group = widget.group;
+    final stagedIndex = group.photos.indexWhere((p) => p.id == staged.id);
+    final photoIndex = group.photos.indexWhere((p) => p.id == photo.id);
+    final PhotoItem left;
+    final PhotoItem right;
+    if (stagedIndex <= photoIndex) {
+      left = staged;
+      right = photo;
+    } else {
+      left = photo;
+      right = staged;
+    }
+
+    Navigator.of(context).push(
+      MaterialPageRoute(
+        builder: (_) => PhotoSliderCompareScreen(left: left, right: right),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
+    super.build(context); // required by AutomaticKeepAliveClientMixin
     final group = widget.group;
     final dateStr =
         '${group.timestamp.year}-${group.timestamp.month.toString().padLeft(2, '0')}-${group.timestamp.day.toString().padLeft(2, '0')}';
@@ -115,6 +175,8 @@ class _PhotoGroupCardState extends State<PhotoGroupCard> {
                     photo: entry.value,
                     allPhotos: group.photos,
                     index: entry.key,
+                    isStagedForCompare: _stagedForCompare?.id == entry.value.id,
+                    onCompareTap: () => _handleCompareCheckboxTap(entry.value),
                   );
                 }).toList(),
               ),
@@ -156,12 +218,16 @@ class _PhotoThumbnail extends StatefulWidget {
   final PhotoItem photo;
   final List<PhotoItem> allPhotos;
   final int index;
+  final bool isStagedForCompare;
+  final VoidCallback onCompareTap;
 
   const _PhotoThumbnail({
     super.key,
     required this.photo,
     required this.allPhotos,
     required this.index,
+    required this.isStagedForCompare,
+    required this.onCompareTap,
   });
 
   @override
@@ -217,9 +283,12 @@ class _PhotoThumbnailState extends State<_PhotoThumbnail> {
               height: 120,
               decoration: BoxDecoration(
                 border: Border.all(
-                  color:
-                      photo.isSelected ? AppColors.accentCyan : Colors.white24,
-                  width: photo.isSelected ? 3 : 1,
+                  color: widget.isStagedForCompare
+                      ? AppColors.accentViolet
+                      : photo.isSelected
+                          ? AppColors.accentCyan
+                          : Colors.white24,
+                  width: widget.isStagedForCompare || photo.isSelected ? 3 : 1,
                 ),
               ),
               child: FutureBuilder<Uint8List?>(
@@ -281,6 +350,35 @@ class _PhotoThumbnailState extends State<_PhotoThumbnail> {
                         : Icons.check_box_outline_blank,
                     color:
                         photo.isSelected ? AppColors.accentCyan : Colors.white,
+                    size: 22,
+                  ),
+                ),
+              ),
+            ),
+            // Compare-checkbox: bottom-right, its own tap target (mirrors
+            // the delete-checkbox's top-right pattern). Checking a 2nd
+            // photo's box in the same group immediately opens the slider
+            // compare screen for the two -- see
+            // _PhotoGroupCardState._handleCompareCheckboxTap.
+            Positioned(
+              bottom: 4,
+              right: 4,
+              child: GestureDetector(
+                behavior: HitTestBehavior.opaque,
+                onTap: widget.onCompareTap,
+                child: Container(
+                  padding: const EdgeInsets.all(2),
+                  decoration: BoxDecoration(
+                    color: Colors.black45,
+                    borderRadius: BorderRadius.circular(4),
+                  ),
+                  child: Icon(
+                    widget.isStagedForCompare
+                        ? Icons.check_box
+                        : Icons.check_box_outline_blank,
+                    color: widget.isStagedForCompare
+                        ? AppColors.accentViolet
+                        : Colors.white,
                     size: 22,
                   ),
                 ),

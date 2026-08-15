@@ -1,19 +1,27 @@
 import 'dart:async';
 
 import 'package:flutter/material.dart';
+import 'package:photo_manager/photo_manager.dart';
 import 'package:provider/provider.dart';
 import '../main.dart';
 import '../models/photo_group.dart';
 import '../models/photo_item.dart';
+import '../models/scan_mode.dart';
+import '../services/blur_scan_service.dart';
+import '../services/large_file_scan_service.dart';
 import '../services/photo_scanner_service.dart';
 import '../services/scan_cache_service.dart';
 import '../services/similarity_service.dart';
 import '../theme/app_theme.dart';
+import '../utils/byte_formatter.dart';
 import '../widgets/gradient_button.dart';
 import 'duplicate_review_screen.dart';
+import 'flagged_photo_review_screen.dart';
 
 class ScanProgressScreen extends StatefulWidget {
-  const ScanProgressScreen({super.key});
+  final ScanMode mode;
+
+  const ScanProgressScreen({super.key, required this.mode});
 
   @override
   State<ScanProgressScreen> createState() => _ScanProgressScreenState();
@@ -40,10 +48,46 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
   // second concurrent scan sharing the same _cache/_stopwatch/_tickTimer.
   bool _isStarting = false;
 
+  // Album-scoping (napkin backlog #8): defaults to null, which
+  // PhotoScannerService.scanAllPhotos treats as "all photos" (its existing
+  // behavior). Only offered on a fresh scan, not a resume -- a resumed scan
+  // continues whatever album the interrupted run already started against.
+  // Duplicates-only: blurry/large-file scans always cover the whole
+  // library by design (there's no "keep the best of this album" concept
+  // for either).
+  List<AssetPathEntity> _albums = [];
+  AssetPathEntity? _selectedAlbum;
+  bool _loadingAlbums = true;
+
+  bool get _isDuplicatesMode => widget.mode == ScanMode.duplicates;
+
   @override
   void initState() {
     super.initState();
-    _checkForResume();
+    if (_isDuplicatesMode) {
+      _checkForResume();
+      _loadAlbums();
+    } else {
+      // Resume/album-scoping (ScanCacheService-backed) only applies to the
+      // duplicate scan -- see PhotoScannerService's cache-backed Phase 2 vs
+      // BlurScanService/LargeFileScanService's simpler single-pass scans.
+      _checkingResume = false;
+      _loadingAlbums = false;
+    }
+  }
+
+  Future<void> _loadAlbums() async {
+    try {
+      final albums = await PhotoScannerService.getAlbumList();
+      if (!mounted) return;
+      setState(() {
+        _albums = albums;
+        _loadingAlbums = false;
+      });
+    } catch (e) {
+      debugPrint('[ScanProgress] Error loading albums: $e');
+      if (mounted) setState(() => _loadingAlbums = false);
+    }
   }
 
   @override
@@ -157,6 +201,17 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
   }
 
   Future<void> _startScanInner({required bool resume}) async {
+    switch (widget.mode) {
+      case ScanMode.duplicates:
+        await _runDuplicateScan(resume: resume);
+      case ScanMode.blurry:
+        await _runBlurScan();
+      case ScanMode.largeFiles:
+        await _runLargeFileScan();
+    }
+  }
+
+  Future<void> _runDuplicateScan({required bool resume}) async {
     final provider = context.read<AppStateProvider>();
 
     if (!resume) {
@@ -180,6 +235,7 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
       final photos = await PhotoScannerService.scanAllPhotos(
         cache: _cache,
         isCancelled: () => _cancelled,
+        album: _selectedAlbum,
         onProgress: (current, total, phase) {
           provider.updateProgress(current / total, '$phase: $current/$total');
         },
@@ -260,6 +316,136 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
     }
   }
 
+  Future<void> _runBlurScan() async {
+    final provider = context.read<AppStateProvider>();
+    setState(() {
+      _cancelled = false;
+      _cancelling = false;
+    });
+    provider.startScan();
+    _startTiming();
+
+    try {
+      final photos = await BlurScanService.scanBlurryPhotos(
+        isCancelled: () => _cancelled,
+        onProgress: (current, total) {
+          provider.updateProgress(
+            total == 0 ? 0 : current / total,
+            'Checking sharpness: $current/$total',
+          );
+        },
+      );
+      debugPrint('[BlurScan] Flagged ${photos.length} blurry photos');
+
+      if (mounted) {
+        provider.finishBlurScan(photos);
+        _stopTiming();
+        Navigator.of(context).pushReplacement(
+          MaterialPageRoute(
+            builder: (_) => FlaggedPhotoReviewScreen(
+              mode: ScanMode.blurry,
+              photosSelector: (p) => p.blurryPhotos,
+              subtitleBuilder: (photo) =>
+                  'Sharpness: ${((photo.sharpnessScore ?? 0) * 100).toStringAsFixed(0)}%',
+              emptyMessage: 'No blurry photos found.',
+            ),
+          ),
+        );
+      }
+    } on ScanCancelledException {
+      debugPrint('[BlurScan] Cancelled by user');
+      provider.cancelScan();
+      _stopTiming();
+      if (mounted) {
+        setState(() {
+          _cancelled = false;
+          _cancelling = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Scan cancelled')),
+        );
+      }
+    } catch (e) {
+      debugPrint('Error during blur scan: $e');
+      provider.cancelScan();
+      _stopTiming();
+      if (mounted) {
+        setState(() {
+          _cancelled = false;
+          _cancelling = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Scan error: $e')),
+        );
+      }
+    }
+  }
+
+  Future<void> _runLargeFileScan() async {
+    final provider = context.read<AppStateProvider>();
+    setState(() {
+      _cancelled = false;
+      _cancelling = false;
+    });
+    provider.startScan();
+    _startTiming();
+
+    try {
+      final photos = await LargeFileScanService.scanLargeFiles(
+        isCancelled: () => _cancelled,
+        onProgress: (current, total) {
+          provider.updateProgress(
+            total == 0 ? 0 : current / total,
+            'Checking file sizes: $current/$total',
+          );
+        },
+      );
+      debugPrint('[LargeFileScan] Flagged ${photos.length} large files');
+
+      if (mounted) {
+        provider.finishLargeFileScan(photos);
+        _stopTiming();
+        Navigator.of(context).pushReplacement(
+          MaterialPageRoute(
+            builder: (_) => FlaggedPhotoReviewScreen(
+              mode: ScanMode.largeFiles,
+              photosSelector: (p) => p.largeFiles,
+              subtitleBuilder: (photo) => ByteFormatter.format(photo.fileSize),
+              emptyMessage: 'No large files found (nothing over '
+                  '${LargeFileScanService.kMinFileSizeBytes ~/ (1024 * 1024)}MB).',
+            ),
+          ),
+        );
+      }
+    } on ScanCancelledException {
+      debugPrint('[LargeFileScan] Cancelled by user');
+      provider.cancelScan();
+      _stopTiming();
+      if (mounted) {
+        setState(() {
+          _cancelled = false;
+          _cancelling = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Scan cancelled')),
+        );
+      }
+    } catch (e) {
+      debugPrint('Error during large-file scan: $e');
+      provider.cancelScan();
+      _stopTiming();
+      if (mounted) {
+        setState(() {
+          _cancelled = false;
+          _cancelling = false;
+        });
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Scan error: $e')),
+        );
+      }
+    }
+  }
+
   void _cancelScan() {
     setState(() {
       _cancelled = true;
@@ -273,7 +459,7 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
 
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Scan for Duplicates'),
+        title: Text(widget.mode.appBarTitle),
       ),
       body: provider.isScanning
           ? Padding(
@@ -348,7 +534,7 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
                     _resumeSummary != null
                         ? 'A previous scan was interrupted. You can resume '
                             'where it left off or start over.'
-                        : 'Tap the button below to scan your photo library for duplicates.',
+                        : widget.mode.readyDescription,
                     textAlign: TextAlign.center,
                     style: const TextStyle(
                       fontSize: 16,
@@ -356,6 +542,48 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
                     ),
                   ),
                   const SizedBox(height: 32),
+                  if (_isDuplicatesMode &&
+                      _resumeSummary == null &&
+                      !_loadingAlbums &&
+                      _albums.isNotEmpty) ...[
+                    DropdownButtonFormField<AssetPathEntity?>(
+                      initialValue: _selectedAlbum,
+                      // Without this, the dropdown button's Row (selected
+                      // item + arrow icon) sizes to its content's intrinsic
+                      // width instead of the available width -- so the
+                      // DropdownMenuItem children's `overflow:
+                      // TextOverflow.ellipsis` never has a width constraint
+                      // to actually clip against, and a long album name
+                      // pushes the Row past the field's bounds (Flutter's
+                      // debug-mode "RIGHT OVERFLOWED BY N PIXELS" banner).
+                      // isExpanded makes the button and its items fill the
+                      // field's width so ellipsis has something to clip to.
+                      isExpanded: true,
+                      decoration: const InputDecoration(
+                        labelText: 'Album',
+                        border: OutlineInputBorder(),
+                      ),
+                      items: [
+                        const DropdownMenuItem<AssetPathEntity?>(
+                          value: null,
+                          child: Text(
+                            'All Photos',
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        ..._albums.map(
+                          (a) => DropdownMenuItem<AssetPathEntity?>(
+                            value: a,
+                            child:
+                                Text(a.name, overflow: TextOverflow.ellipsis),
+                          ),
+                        ),
+                      ],
+                      onChanged: (value) =>
+                          setState(() => _selectedAlbum = value),
+                    ),
+                    const SizedBox(height: 20),
+                  ],
                   if (_checkingResume)
                     const SizedBox(
                       height: 20,
