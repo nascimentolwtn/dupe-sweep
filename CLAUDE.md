@@ -169,6 +169,84 @@ Use `async`/`await` for future-based calls; wrap long operations in `compute()` 
 ### Testing
 Test-specific logic lives in `test/`. Focus on algorithm correctness (clustering, hashing) rather than UI tests initially. Use `flutter test` for all Dart tests.
 
+## Sibling Python Tools (Not the Flutter App)
+
+Two Python prototypes live alongside the Flutter app under `python/`, but
+are not part of its build (`flutter build`/`flutter run` never touch them —
+not under `assets/`, not in `pubspec.yaml`):
+
+### `python/mvp1/`
+The original validated dedup pipeline against a **local folder** — built
+and run against a real ~3,900-photo library before the clustering/hashing/
+scoring logic was ported into `lib/services/similarity_service.dart` and
+`scoring_service.dart`. Kept as the local-folder reference; if the
+algorithm changes here, mirror it there (or note the divergence).
+- `find_duplicate_photos.py` — scans, time-clusters, phash-subgroups,
+  sharpness/exposure-scores, writes a Markdown + CSV report. Threaded,
+  resumable via `hash_cache.json`/`score_cache.json`.
+- `build_review_html.py` — builds a self-contained HTML review page with
+  embedded thumbnails and a `file://` lightbox.
+- `apply_delete_list.py` — moves files listed in the exported CSV into a
+  sibling `_to_delete` folder. Never hard-deletes.
+- Run: `pip install pillow imagehash numpy`, then
+  `python3 find_duplicate_photos.py <folder> --out-dir ./run`,
+  `python3 build_review_html.py --out-dir ./run`,
+  `python3 apply_delete_list.py ./run/delete_list.csv`.
+
+### `python/mvp2-remote/`
+Same pipeline pointed at a folder on a **network-reachable machine**
+(originally a backup netbook) over SSH/SFTP (`paramiko`), with delete
+triggered directly from the browser instead of a CSV export. All heavy
+image work (hashing, scoring, thumbnailing) runs on this PC, not the
+remote machine — no server or new dependency is installed there, just the
+`sshd` it's already reachable through.
+- `remote_client.py` — SSH/SFTP connect, recursive remote walk
+  (`list_images`), folder-picker listing (`list_subdirs`), prefetched
+  bulk reads (`read_bytes`), move-to-`_to_delete` with collision handling
+  (`move_to_trash`).
+- `scan_remote.py` — staged, threaded, resumable hash → cluster → score →
+  thumbnail pipeline (`run_scan()`, importable). CLI power-user shortcut:
+  `python3 scan_remote.py <remote-folder> --host 192.168.4.36 --out-dir ./run`.
+- `serve_review.py` — local Flask app, the single entry point
+  (browse → scan → review → delete): `python3 serve_review.py --host 192.168.4.36 --out-dir ./run`,
+  then open `http://127.0.0.1:5000/`.
+- Setup: `pip install -r python/mvp2-remote/requirements.txt` (adds
+  `paramiko`, `flask` on top of mvp1's deps). SSH key-based auth to the
+  remote machine is a prerequisite, set up outside this code.
+- Same **move-to-`_to_delete`, never hard-delete** guarantee as
+  `apply_delete_list.py`. See `python/mvp2-remote/README_MVP2.md` for the
+  full divergence notes and the sync-folder caution (don't stage deletes
+  inside a folder under active two-way sync).
+
+### Daily Usage
+
+**mvp1 (local folder):**
+```bash
+cd python/mvp1
+.venv\Scripts\activate          # or: source .venv/bin/activate on macOS/Linux
+
+python3 find_duplicate_photos.py <folder> --out-dir ./run --max-seconds 30
+# re-run the same command until it stops reporting "still not hashed/scored"
+
+python3 build_review_html.py --out-dir ./run --max-seconds 30
+# open run/duplicate_review.html in a browser, review, export delete_list.csv
+
+python3 apply_delete_list.py run/delete_list.csv
+```
+
+**mvp2-remote (netbook over SSH, e.g. `192.168.4.36`):**
+```bash
+cd python/mvp2-remote
+.venv\Scripts\activate          # or: source .venv/bin/activate on macOS/Linux
+
+python3 serve_review.py --host 192.168.4.36 --out-dir ./run
+# username, start-path, and key-filename all default (netbook / /media/backup /
+# the WSL SSH key) -- override with --username/--start-path/--key-filename/
+# --password if needed, or set DUPESWEEP_SSH_KEY to change the default key path
+# open http://127.0.0.1:5000/ -- browse -> scan -> review -> delete
+# (delete moves the file into _to_delete on the netbook, never hard-deletes)
+```
+
 ## Important Constraints
 
 1. **No Cloud**: This is a personal tool. Do not add cloud sync, analytics, or telemetry.

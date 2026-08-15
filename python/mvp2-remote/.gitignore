@@ -1,0 +1,11 @@
+# Generated run artifacts — contain real remote file paths and embedded
+# photo thumbnails from whatever netbook folder was scanned. Never commit.
+run/
+*.json
+hash_cache.json
+score_cache.json
+thumb_cache.json
+deleted_paths.json
+
+# Local virtualenv
+.venv/

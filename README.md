@@ -107,6 +107,19 @@ Current tests cover:
 - Hamming distance calculations
 - Perceptual hash grouping logic
 
+## Remote/Netbook Dedup (Python prototype, not the Android app)
+
+`python/mvp2-remote/` is a separate command-line/browser tool for
+deduplicating photos that live on a *different* machine reachable over
+SSH — for example an old backup box too weak to hash/score thousands of
+photos itself. Point it at a folder on that machine, review duplicate
+groups in a browser (thumbnails, sharpness/exposure scoring, "best" pick),
+and delete straight from the page — the file is only ever moved into a
+`_to_delete` folder, never hard-deleted. See
+`python/mvp2-remote/README_MVP2.md` for setup and usage, and
+`python/mvp1/README_MVP1.md` for the original local-only variant this was
+built from.
+
 ## License
 
 Personal use only.
