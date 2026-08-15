@@ -1,7 +1,11 @@
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
+import 'package:provider/provider.dart';
+import '../main.dart';
+import '../services/review_cache_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/gradient_button.dart';
+import 'duplicate_review_screen.dart';
 import 'scan_progress_screen.dart';
 
 class PermissionScreen extends StatefulWidget {
@@ -25,11 +29,7 @@ class _PermissionScreenState extends State<PermissionScreen> {
 
     if (status.isGranted || status.isLimited) {
       if (mounted) {
-        Navigator.of(context).pushReplacement(
-          MaterialPageRoute(
-            builder: (_) => const ScanProgressScreen(),
-          ),
-        );
+        await _navigateAfterPermissionGranted();
       }
       return;
     }
@@ -38,6 +38,32 @@ class _PermissionScreenState extends State<PermissionScreen> {
       setState(() {
         _checking = false;
       });
+    }
+  }
+
+  /// Routes to the review screen directly if a saved review list exists
+  /// (see `ReviewCacheService`/`AppStateProvider.loadSavedReview`) so the
+  /// user isn't forced through a full rescan when nothing's changed since
+  /// last time; otherwise falls back to the normal scan flow. A "Re-scan"
+  /// button is always available from the review screen if a fresh scan is
+  /// wanted instead.
+  Future<void> _navigateAfterPermissionGranted() async {
+    final savedGroups = await ReviewCacheService().load();
+    if (!mounted) return;
+
+    if (savedGroups != null) {
+      context.read<AppStateProvider>().loadSavedReview(savedGroups);
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(
+          builder: (_) => const DuplicateReviewScreen(),
+        ),
+      );
+    } else {
+      Navigator.of(context).pushReplacement(
+        MaterialPageRoute(
+          builder: (_) => const ScanProgressScreen(),
+        ),
+      );
     }
   }
 
@@ -51,11 +77,7 @@ class _PermissionScreenState extends State<PermissionScreen> {
 
     if (status.isGranted || status.isLimited) {
       if (mounted) {
-        Navigator.of(context).pushReplacement(
-          MaterialPageRoute(
-            builder: (_) => const ScanProgressScreen(),
-          ),
-        );
+        await _navigateAfterPermissionGranted();
       }
     } else if (status.isDenied) {
       if (mounted) {

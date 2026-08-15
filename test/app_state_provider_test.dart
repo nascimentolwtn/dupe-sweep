@@ -1,7 +1,10 @@
+import 'dart:io';
+
 import 'package:flutter_test/flutter_test.dart';
 import 'package:dupesweep/main.dart';
 import 'package:dupesweep/models/photo_group.dart';
 import 'package:dupesweep/models/photo_item.dart';
+import 'package:dupesweep/services/review_cache_service.dart';
 
 PhotoItem _photo(String id, {int fileSize = 1000, bool isBest = false}) =>
     PhotoItem(
@@ -325,6 +328,96 @@ void main() {
 
       expect(provider.photoGroups.map((g) => g.id), ['g1', 'g4']);
       expect(provider.pendingExpandGroupId, 'g1');
+    });
+  });
+
+  group('AppStateProvider review-cache persistence', () {
+    late Directory tempDir;
+
+    setUp(() {
+      tempDir = Directory.systemTemp.createTempSync('app_state_review_test_');
+    });
+
+    tearDown(() {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    });
+
+    test('finishScan persists the review list for a later launch to resume',
+        () async {
+      final reviewCache = ReviewCacheService(directory: tempDir);
+      final provider = AppStateProvider(reviewCache: reviewCache);
+      final groups = [
+        PhotoGroup(
+          id: 'g1',
+          photos: [_photo('a'), _photo('b')],
+          timestamp: DateTime(2024, 1, 1),
+        ),
+      ];
+
+      provider.finishScan(groups);
+      // finishScan fires the save off without awaiting it (see main.dart) --
+      // await the debug-only hook so the background write has actually
+      // landed on disk before asserting against it.
+      await provider.debugLastReviewSave;
+
+      final reloaded = await ReviewCacheService(directory: tempDir).load();
+      expect(reloaded, isNotNull);
+      expect(reloaded!.single.id, 'g1');
+      expect(reloaded.single.photos.map((p) => p.id), ['a', 'b']);
+    });
+
+    test(
+        'removeDeletedPhotos re-saves the review list so a later launch '
+        'never resumes into already-deleted photos', () async {
+      final reviewCache = ReviewCacheService(directory: tempDir);
+      final provider = AppStateProvider(reviewCache: reviewCache);
+      provider.photoGroups = [
+        PhotoGroup(
+          id: 'g1',
+          photos: [_photo('a'), _photo('b'), _photo('c')],
+          timestamp: DateTime(2024, 1, 1),
+        ),
+      ];
+
+      provider.removeDeletedPhotos({'b'});
+      await provider.debugLastReviewSave;
+
+      final reloaded = await ReviewCacheService(directory: tempDir).load();
+      expect(reloaded, isNotNull);
+      expect(reloaded!.single.photos.map((p) => p.id), ['a', 'c']);
+    });
+
+    test('loadSavedReview sets photoGroups and clears isScanning', () {
+      final provider = AppStateProvider(
+        reviewCache: ReviewCacheService(directory: tempDir),
+      );
+      provider.isScanning = true;
+      final groups = [
+        PhotoGroup(
+          id: 'g1',
+          photos: [_photo('a'), _photo('b')],
+          timestamp: DateTime(2024, 1, 1),
+        ),
+      ];
+
+      provider.loadSavedReview(groups);
+
+      expect(provider.photoGroups, groups);
+      expect(provider.isScanning, isFalse);
+    });
+
+    test('loadSavedReview notifies listeners', () {
+      final provider = AppStateProvider(
+        reviewCache: ReviewCacheService(directory: tempDir),
+      );
+      var notified = false;
+      provider.addListener(() => notified = true);
+
+      provider.loadSavedReview([]);
+
+      expect(notified, isTrue);
     });
   });
 }

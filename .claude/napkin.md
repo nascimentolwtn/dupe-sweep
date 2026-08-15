@@ -64,30 +64,30 @@ Expose configurable time window (default 120s) and Hamming distance threshold (d
 - **Impact**: Lets power users fine-tune grouping behavior
 - **Effort**: Medium—add new screen, wire to state management, persist to SharedPreferences
 
-### 7. Persist the review list across app restarts (requested 2026-08-14)
-Currently `AppStateProvider.photoGroups` is pure in-memory state -- closing
-the app loses the built review list entirely, forcing a full re-scan next
-launch even though nothing changed. `ScanCacheService`'s save-points only
-cover an *in-progress* scan's hashing work, not the *finished* grouped
-result.
-- **Wanted flow**: after a scan completes (and after every delete, so the
-  saved copy never goes stale/points at deleted photos), persist the
-  current `photoGroups` (+ selection state) to disk. On next launch, if a
-  saved list exists, offer to resume reviewing it directly -- skip
-  scanning entirely -- with a "Full rescan" button always available for
-  when the user wants a fresh scan instead.
-- **Design notes for whoever picks this up**: reuse the `ScanCacheService`
-  JSON-file pattern (temp-file-then-rename, version field) rather than
-  inventing a second mechanism; needs to store `PhotoGroup.id`/`groupType`/
-  timestamp plus each `PhotoItem`'s id/fileSize/dhash/isBest/isSelected --
-  everything `buildPhotoGroups` doesn't need to be recomputed from scratch.
-  Write on `finishScan` and on every `removeDeletedPhotos` call (both
-  already funnel through `AppStateProvider`, so both are natural save
-  points). `main.dart`'s entry point (`PermissionScreen` -> auto-navigate)
-  would need a new fork: saved review list exists -> go straight to
-  `DuplicateReviewScreen`; otherwise -> `ScanProgressScreen` as today.
-- **Effort**: Medium -- mostly plumbing similar to the existing scan-cache
-  save points, plus one new decision point in the permission->home routing.
+### 7. Persist the review list across app restarts ✅ DONE (2026-08-14)
+New `lib/services/review_cache_service.dart` (`ReviewCacheService`), mirrors
+`ScanCacheService`'s temp-file-then-rename JSON pattern in a separate
+`review_cache.json`. `AppStateProvider` now takes an injectable
+`ReviewCacheService` and calls `save(photoGroups)` (fire-and-forget, tracked
+via `@visibleForTesting debugLastReviewSave` for deterministic test
+awaiting) from both `finishScan` and `removeDeletedPhotos`, so the saved
+copy is always written on scan completion and kept in sync after every
+delete. `PermissionScreen._navigateAfterPermissionGranted` loads the saved
+list on the permission-granted path; if one exists it calls the new
+`AppStateProvider.loadSavedReview` and routes straight to
+`DuplicateReviewScreen`, otherwise falls through to `ScanProgressScreen` as
+before. `SummaryBar`'s existing "Re-scan" button doubles as the "Full
+rescan" escape hatch — a fresh scan's `finishScan` overwrites the saved
+copy. An empty saved list (e.g. every group got deleted down to nothing)
+is treated as "nothing to resume" (`load()` returns `null`), falling back
+to a fresh scan rather than showing an empty resumed screen. Tests:
+`test/review_cache_service_test.dart` (round-trip, overwrite, empty/no-op,
+clear, corrupt file, wrong version, malformed-group dropping) +
+`test/app_state_provider_test.dart`'s "review-cache persistence" group.
+`flutter analyze` clean, `flutter test` passing (pre-existing unrelated
+flake: `similarity_service_test.dart`'s `clusterByTime clusters photos
+within time window`, confirmed failing on a clean `main` checkout too, not
+caused by this change).
 
 ### 8. Advanced Features (Phase 2+, Do Not Start Yet)
 - Re-scan flow (merge with previous results) — NOTE: basic Re-scan button now

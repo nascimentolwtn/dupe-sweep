@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'models/photo_group.dart';
 import 'screens/permission_screen.dart';
+import 'services/review_cache_service.dart';
 import 'theme/app_theme.dart';
 
 void main() {
@@ -27,6 +28,24 @@ class DupesweepApp extends StatelessWidget {
 }
 
 class AppStateProvider extends ChangeNotifier {
+  // Injectable for testability (mirrors ScanCacheService's pattern); defaults
+  // to the real on-disk service in production.
+  final ReviewCacheService _reviewCache;
+
+  AppStateProvider({ReviewCacheService? reviewCache})
+      : _reviewCache = reviewCache ?? ReviewCacheService();
+
+  /// The most recently kicked-off review-list save, if any. Production
+  /// callers never await this -- a save failure isn't worth blocking or
+  /// erroring the UI over (see [ReviewCacheService.save]'s own error
+  /// handling) -- but tests need a deterministic way to know a fire-and-
+  /// forget save has actually finished landing on disk before asserting
+  /// against it, since real file I/O doesn't reliably settle within
+  /// `pumpEventQueue()`'s microtask/timer draining the way pure-Dart
+  /// futures do.
+  @visibleForTesting
+  Future<void>? debugLastReviewSave;
+
   List<PhotoGroup> photoGroups = [];
   bool isScanning = false;
   double scanProgress = 0.0;
@@ -45,6 +64,18 @@ class AppStateProvider extends ChangeNotifier {
   }
 
   void finishScan(List<PhotoGroup> groups) {
+    photoGroups = groups;
+    isScanning = false;
+    // Fire-and-forget: a save failure just means next launch falls back to
+    // a full rescan, not something worth blocking/erroring the UI over.
+    debugLastReviewSave = _reviewCache.save(photoGroups);
+    notifyListeners();
+  }
+
+  /// Restores a previously-saved review list (see [ReviewCacheService]) so
+  /// the app can skip straight to reviewing on launch instead of forcing a
+  /// full rescan when nothing has changed since last time.
+  void loadSavedReview(List<PhotoGroup> groups) {
     photoGroups = groups;
     isScanning = false;
     notifyListeners();
@@ -118,6 +149,10 @@ class AppStateProvider extends ChangeNotifier {
     for (final group in photoGroups) {
       group.ensureBestElected();
     }
+
+    // Keep the saved copy in sync so a later restart never resumes into
+    // already-deleted photos.
+    debugLastReviewSave = _reviewCache.save(photoGroups);
 
     notifyListeners();
   }
