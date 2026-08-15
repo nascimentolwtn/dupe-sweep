@@ -16,16 +16,17 @@ class SimilarityService {
 
     final clusters = <List<PhotoItem>>[];
     var currentCluster = <PhotoItem>[photos.first];
+    var clusterStart = photos.first.createDateTime;
 
     for (int i = 1; i < photos.length; i++) {
-      final timeDiff =
-          photos[i].createDateTime.difference(photos[i - 1].createDateTime);
+      final timeDiff = photos[i].createDateTime.difference(clusterStart);
 
       if (timeDiff.inSeconds <= timeWindowSeconds) {
         currentCluster.add(photos[i]);
       } else {
         clusters.add(currentCluster);
         currentCluster = [photos[i]];
+        clusterStart = photos[i].createDateTime;
       }
     }
     clusters.add(currentCluster);
