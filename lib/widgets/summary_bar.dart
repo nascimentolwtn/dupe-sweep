@@ -2,6 +2,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import '../main.dart';
 import '../models/photo_group.dart';
+import '../models/scan_mode.dart';
 import '../screens/scan_progress_screen.dart';
 import '../theme/app_theme.dart';
 import '../utils/byte_formatter.dart';
@@ -77,7 +78,8 @@ class SummaryBar extends StatelessWidget {
                 onPressed: () {
                   Navigator.of(context).pushReplacement(
                     MaterialPageRoute(
-                      builder: (_) => const ScanProgressScreen(),
+                      builder: (_) =>
+                          const ScanProgressScreen(mode: ScanMode.duplicates),
                     ),
                   );
                 },

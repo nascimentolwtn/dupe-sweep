@@ -5,6 +5,30 @@ import '../models/photo_item.dart';
 import 'scan_cache_service.dart';
 import 'similarity_service.dart';
 
+/// Orders photos by capture time, breaking exact-timestamp ties by `id` so
+/// the overall order is fully deterministic. Top-level (not a method on
+/// [PhotoScannerService]) so it can be unit-tested directly, matching
+/// `buildPhotoGroups`'s pattern in `scan_progress_screen.dart`.
+///
+/// Without the tie-break, two photos sharing the same `createDateTime`
+/// (burst shots, same-second captures -- exactly the photos most likely to
+/// be duplicates, the whole reason this app exists) sort relative to each
+/// other however `List.sort` happens to leave them, which depends on
+/// `photosById`'s insertion order in [PhotoScannerService.scanAllPhotos]'s
+/// Phase 1 -- itself non-deterministic, since photos are fetched via
+/// `Future.wait` over concurrent futures that can complete in a different
+/// order every run. `SimilarityService.clusterByTime` walks this list
+/// comparing each photo only to its immediate predecessor, so which of two
+/// near-simultaneous duplicates ends up adjacent to which OTHER photo can
+/// silently change between scans of the exact same library, splitting them
+/// into different time clusters (and therefore never hash-compared) on one
+/// run but not another.
+int comparePhotosByTimeThenId(PhotoItem a, PhotoItem b) {
+  final cmp = a.createDateTime.compareTo(b.createDateTime);
+  if (cmp != 0) return cmp;
+  return a.id.compareTo(b.id);
+}
+
 /// Thrown by [PhotoScannerService.scanAllPhotos] when `isCancelled` reports
 /// true partway through a scan. Callers should catch this specifically --
 /// unlike other scan errors, a cancellation isn't a failure to report, it's
@@ -54,10 +78,17 @@ class PhotoScannerService {
   /// [cache] (so progress isn't lost) and throws [ScanCancelledException]
   /// instead of returning -- this is a deliberate user action, not an
   /// error, so callers should catch it separately from other failures.
+  ///
+  /// [album], when provided, scans just that album instead of the device's
+  /// default "all photos" album -- lets a caller scope a scan to e.g. a
+  /// specific WhatsApp media folder via [getAlbumList]. Everything
+  /// downstream (clustering, hashing, grouping) is unaffected by which
+  /// album the assets came from.
   static Future<List<PhotoItem>> scanAllPhotos({
     void Function(int current, int total, String phase)? onProgress,
     ScanCacheService? cache,
     bool Function()? isCancelled,
+    AssetPathEntity? album,
   }) async {
     try {
       debugPrint('[PhotoScanner] Starting scan...');
@@ -72,19 +103,23 @@ class PhotoScannerService {
             '[PhotoScanner] BackgroundIsolate already initialized or main thread: $e');
       }
 
-      final albums = await PhotoManager.getAssetPathList(
-        onlyAll: true,
-        type: RequestType.image,
-      );
+      var scanAlbum = album;
+      if (scanAlbum == null) {
+        final albums = await PhotoManager.getAssetPathList(
+          onlyAll: true,
+          type: RequestType.image,
+        );
 
-      debugPrint('[PhotoScanner] Found ${albums.length} albums');
-      if (albums.isEmpty) {
-        debugPrint('[PhotoScanner] No albums found!');
-        return [];
+        debugPrint('[PhotoScanner] Found ${albums.length} albums');
+        if (albums.isEmpty) {
+          debugPrint('[PhotoScanner] No albums found!');
+          return [];
+        }
+
+        scanAlbum = albums.first;
       }
 
-      final album = albums.first;
-      final assetCount = await album.assetCountAsync;
+      final assetCount = await scanAlbum.assetCountAsync;
       debugPrint('[PhotoScanner] Album has $assetCount assets');
 
       if (assetCount == 0) {
@@ -92,7 +127,7 @@ class PhotoScannerService {
         return [];
       }
 
-      final allAssets = await album.getAssetListRange(
+      final allAssets = await scanAlbum.getAssetListRange(
         start: 0,
         end: assetCount,
       );
@@ -127,8 +162,7 @@ class PhotoScannerService {
         }));
       }
 
-      final metadataPhotos = photosById.values.toList()
-        ..sort((a, b) => a.createDateTime.compareTo(b.createDateTime));
+      final metadataPhotos = photosById.values.toList()..sort(comparePhotosByTimeThenId);
 
       // ---- Determine which photos actually need a perceptual hash. ----
       final clusters = SimilarityService.clusterByTime(metadataPhotos);
@@ -198,8 +232,7 @@ class PhotoScannerService {
         }));
       }
 
-      final photos = photosById.values.toList()
-        ..sort((a, b) => a.createDateTime.compareTo(b.createDateTime));
+      final photos = photosById.values.toList()..sort(comparePhotosByTimeThenId);
 
       return photos;
     } on ScanCancelledException {
@@ -223,6 +256,20 @@ class PhotoScannerService {
       debugPrint('[PhotoScanner] StackTrace: $stackTrace');
       rethrow;
     }
+  }
+
+  /// Returns the device's actual album list (e.g. "Camera", "Screenshots",
+  /// "WhatsApp Images") for the album-scoping picker on the scan screen.
+  /// `onlyAll: false` is the key difference from the default `scanAllPhotos`
+  /// call -- that one only wants the single synthetic "all photos" album,
+  /// this one wants every real album so the user can pick one to scope a
+  /// scan to. `RequestType.common` (not `.image`) so video-only albums
+  /// (e.g. "WhatsApp Video") show up too.
+  static Future<List<AssetPathEntity>> getAlbumList() {
+    return PhotoManager.getAssetPathList(
+      onlyAll: false,
+      type: RequestType.common,
+    );
   }
 
   /// Fetches just enough to sort/cluster and display a photo: creation

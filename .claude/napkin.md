@@ -89,16 +89,130 @@ flake: `similarity_service_test.dart`'s `clusterByTime clusters photos
 within time window`, confirmed failing on a clean `main` checkout too, not
 caused by this change).
 
-### 8. Advanced Features (Phase 2+, Do Not Start Yet)
-- Re-scan flow (merge with previous results) — NOTE: basic Re-scan button now
-  exists (full rescan, not a merge) as of 2026-08-14
-- Slider review UI: overlapping 2-photo view with left/right slider to reveal
-  one or the other (easier comparison than side-by-side)
-- WhatsApp media scoping
-- Blurry photo detector
-- Cache/junk cleaner
-- Large-file finder
-- iOS support (untested)
+### 8. Slider Compare, Blurry Detector, Large-File Finder, Album Scoping ✅ DONE (2026-08-14, merged to main 2026-08-15)
+Implemented in isolated worktree `backlog8-advanced-features` (branch
+`worktree-backlog8-advanced-features`), merged to `main` via `--no-ff` merge
+commit. Plan: `.claude/plans/drifting-scribbling-token.md`.
+- **Slider review UI**: `lib/screens/photo_slider_compare_screen.dart` —
+  drag-divider overlap compare of any 2 photos, staged via long-press on
+  two thumbnails in `PhotoGroupCard` (its `onLongPress` was unused before
+  this). Free 2-of-N picker, not restricted to exactly-2-photo groups.
+- **Album scoping** (generalizes "WhatsApp media scoping"):
+  `PhotoScannerService.getAlbumList()` + optional `album` param on
+  `scanAllPhotos`; picker shown on `ScanProgressScreen`'s ready-to-scan
+  card, duplicates mode only. WhatsApp Images/Video just show up as
+  ordinary albums — no WhatsApp-specific code needed.
+- **New home/menu screen** (`lib/screens/home_screen.dart`): fork point for
+  the 3 scan modes (`lib/models/scan_mode.dart`'s `ScanMode` enum).
+  `PermissionScreen` now routes here instead of straight into the dupe
+  scan; `ScanProgressScreen` takes a required `mode` param and dispatches
+  to `_runDuplicateScan`/`_runBlurScan`/`_runLargeFileScan`.
+- **Blurry photo detector**: `lib/services/blur_scan_service.dart`, reuses
+  `ScoringService.computeSharpness` (already correct/tested) across every
+  photo (not just time-cluster candidates), threshold 0.15. Deliberately
+  NO checkpoint/resume cache (scope trim vs. the plan's original
+  `blur_cache_service.dart` — a single full pass was judged not worth the
+  added dual-resume-UI complexity; `isCancelled` still works via the
+  shared `ScanCancelledException`).
+- **Large-file finder**: `lib/services/large_file_scan_service.dart`,
+  scoped to the photo/video library (`RequestType.common`, metadata-only,
+  10MB floor, top 100 results) — NOT a general filesystem scan, avoiding
+  `MANAGE_EXTERNAL_STORAGE` (see Constraints below). Needed
+  `READ_MEDIA_VIDEO` added to the manifest + `Permission.videos` requested
+  alongside `Permission.photos`.
+- **Shared review UI**: blurry/large-file results are flat,
+  independently-flagged lists (no "best photo" comparison), so they share
+  `lib/screens/flagged_photo_review_screen.dart` +
+  `lib/widgets/flagged_photo_list.dart` rather than reusing
+  `PhotoGroupCard`/`SummaryBar` (those are shaped around `PhotoGroup`).
+- **Cut**: general cache/junk cleaner — no public Android API to clear
+  another app's cache without `MANAGE_EXTERNAL_STORAGE` + the file-manager
+  role, which Play Store restricts to actual file-manager apps.
+- **Cut**: re-scan-as-merge — user judged the existing full-rescan button
+  sufficient as-is.
+- `flutter analyze` clean, `flutter test` 117/118 passing (same
+  pre-existing `clusterByTime` flake noted in item 7, unrelated to this
+  work). New test: `test/photo_slider_compare_screen_test.dart`.
+- **Not yet done**: Settings-screen wiring for the blur threshold. On-device
+  testing (Samsung SM-G990E) done -- see item 10 for what it found.
+- iOS support remains untested/out of scope (see Constraints below).
+- **Bug found + fixed during on-device testing (2026-08-15)**:
+  `PhotoScannerService`'s Phase 1 metadata fetch runs 16 concurrent futures
+  per chunk and inserts into a `Map` in completion order (non-deterministic
+  I/O timing), then sorts by `createDateTime` — but `List.sort` isn't
+  stable, so photos sharing an exact timestamp (burst shots, batch
+  imports/saves — exactly the ones most likely to be duplicates) could sort
+  relative to each other differently between runs of the SAME library,
+  making "Scan All Photos" non-reproducible run to run. Fixed via
+  `comparePhotosByTimeThenId` (tie-break by `id`), regression test in
+  `test/photo_scanner_service_test.dart`.
+- **Still open**: after the above fix, re-scanning the SAME library
+  consistently gives the SAME group count -- confirmed on-device, matches
+  the count from a pristine baseline build of `main` (commit `1044541`) too
+  -- but an earlier (pre-fix, non-deterministic) run had shown a much
+  higher count (~75 vs. the now-stable ~35) on the same library. Root
+  cause traced to `SimilarityService.groupBySimilarity`
+  (`lib/services/similarity_service.dart`): it's a greedy, anchor-based
+  grouper -- the first not-yet-used photo in list order becomes the
+  "anchor," and only photos within the Hamming threshold OF THAT ANCHOR
+  join its group (not of each other) -- so for a "chain" of similar photos
+  (A~B and B~C both match, but A~C doesn't), the result depends on which
+  one happens to be the anchor. This is a real, pre-existing, order-
+  dependent design property, not something introduced this session --
+  user asked whether to change it to an order-independent transitive/
+  connected-components grouping (would likely be more inclusive and, more
+  importantly, stop depending on list order at all) -- **decision still
+  pending**, do not implement without an explicit go-ahead.
+
+### 9. Show group count in the Review screen header ✅ DONE (2026-08-15)
+`DuplicateReviewScreen`'s AppBar title now reads "Review Duplicates (XX
+groups)" (singular "group" for XX=1, plain "Review Duplicates" for
+XX=0 -- the empty state already says "No duplicates found" there, a count
+would be redundant). Switched the screen from a body-scoped `Consumer` to
+`context.watch<AppStateProvider>()` at the top of `build()` so the AppBar
+title -- not just the body -- rebuilds when `photoGroups` changes; a
+`Consumer` wrapping only the body never would have reached the title.
+Live-updates through the existing `AppStateProvider.removeDeletedPhotos` ->
+`notifyListeners()` path, no new state needed. Later renamed to "Review
+Dupes (XX groups)" per user request (2026-08-15).
+
+### 10. On-device UX fixes from testing rounds ✅ DONE (2026-08-15)
+Found/requested while testing item 8 on a real device (Samsung SM-G990E),
+all in the same merged branch:
+- Fullscreen viewer: `PageView` swipe-to-next-photo was stealing the
+  gesture arena from `InteractiveViewer`'s pinch-to-zoom. Fixed with a
+  `Listener`-tracked pointer count (paging fully disabled once a 2nd finger
+  is down) + a custom `PageScrollPhysics` with a higher
+  `dragStartDistanceMotionThreshold` for single-finger swipes.
+- Slider compare screen gained zoom (+/- buttons in the AppBar, 1x-4x) and
+  pan (arrows on the 4 screen edges, shown only while zoomed) -- both
+  apply identically to both photo layers (`Transform.scale`/`.translate`
+  with the same `scale`/`pan` values) so they stay aligned; buttons rather
+  than pinch/drag gestures, which would have fought the divider's own drag
+  gesture in the same view. Pan is clamped to how far the zoomed content
+  actually extends past the viewport.
+- Album picker: `DropdownButtonFormField` was missing `isExpanded: true`,
+  so long album names overflowed (Flutter's debug "RIGHT OVERFLOWED BY N
+  PIXELS" banner) instead of the existing `TextOverflow.ellipsis` kicking
+  in.
+- Scan progress label showed the PREVIOUS scan's stale "X/X" numbers until
+  the new scan's first progress callback fired -- `AppStateProvider.
+  startScan()` now clears `scanStatus` to `null` so it falls back to the
+  generic "Scanning..." label instead.
+- `PhotoGroupCard`'s expanded/collapsed state was getting lost on fast
+  scrolling (ListView.builder disposes off-screen State beyond the cache
+  extent). Fixed via `AutomaticKeepAliveClientMixin` with `wantKeepAlive =>
+  _isExpanded` (only pins alive the cards actually expanded).
+- After a delete collapses a group to 0-1 photos, the review screen now
+  auto-scrolls (not just auto-expands, which already existed) to the
+  neighbor group via a per-group `GlobalKey` + `Scrollable.ensureVisible`.
+- Compare pair-staging changed from long-press to a checkbox in each
+  thumbnail's bottom-right corner (checking a 2nd photo immediately opens
+  the compare screen); left/right in the compare screen is now assigned by
+  the photos' position within the group, not tap order.
+- Fixed the slider's visual direction: dragging the divider right now
+  reveals more of the LEFT photo (was backwards -- the clipped/base layer
+  roles in the `Stack` were swapped from what the divider position implied).
 
 ## Backlog: Remote Netbook Dedup (python-mvp1 extension, not the Flutter app)
 
@@ -160,7 +274,7 @@ Backlog item to prepare DupeSweep for public release on Google Play Store.
 **No Cloud**: This is a personal tool. Never add analytics, telemetry, or cloud sync.
 **Explicit Deletion**: Every delete requires user confirmation + OS dialog. No silent deletes.
 **Android First**: iOS support is aspirational but untested. Do not spend time on it yet.
-**Scoped Storage**: Large-file finder needs MANAGE_EXTERNAL_STORAGE permission (only viable for sideloaded apps, not Play Store).
+**Scoped Storage**: A general any-file large-file/junk finder needs MANAGE_EXTERNAL_STORAGE (Play-Store-incompatible, file-manager-role only). The implemented large-file finder (2026-08-14, item 8) is scoped to the photo/video library instead, avoiding that permission — a general filesystem version and the cache/junk cleaner both remain cut for this reason.
 
 ## Git & Commits
 
