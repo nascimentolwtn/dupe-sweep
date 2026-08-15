@@ -92,6 +92,8 @@ caused by this change).
 ### 8. Advanced Features (Phase 2+, Do Not Start Yet)
 - Re-scan flow (merge with previous results) — NOTE: basic Re-scan button now
   exists (full rescan, not a merge) as of 2026-08-14
+- Slider review UI: overlapping 2-photo view with left/right slider to reveal
+  one or the other (easier comparison than side-by-side)
 - WhatsApp media scoping
 - Blurry photo detector
 - Cache/junk cleaner
@@ -144,6 +146,14 @@ constraint learned the hard way".
   `.claude/plans/archive-remote-photos.md`.
 - **Effort**: Low-Medium — mostly a recursive same-disk move + folder-picker
   UI reuse; no hashing/scoring/thumbnailing involved at all.
+
+## Release & Play Store Publication
+
+### Prepare App for Play Store Publication
+Backlog item to prepare DupeSweep for public release on Google Play Store.
+- **Scope**: TBD (app signing, privacy policy, screenshots, release notes, version management, testing on multiple devices)
+- **Status**: Not started
+- **Effort**: TBD — requires app signing setup, Play Store account, metadata preparation
 
 ## Constraints & Gotchas
 
