@@ -28,7 +28,16 @@ class BlurScanService {
   /// scale (1 = sharpest) are flagged as blurry. Hardcoded for now; wiring
   /// this to the napkin's still-pending Settings screen is a natural
   /// follow-up, not part of this feature.
-  static const double kBlurThreshold = 0.15;
+  ///
+  /// Lowered from 0.15: variance-of-Laplacian conflates low texture with
+  /// low focus, so bright/low-texture-but-in-focus photos (blown
+  /// highlights, sky, smooth skin) were landing in the same low-single-
+  /// -digit-percent range as genuinely blurry ones. A stricter cutoff
+  /// trades some missed true positives for fewer of those false ones; the
+  /// exposure % now shown alongside sharpness in the review list (see
+  /// `_scoreSharpness` below and `FlaggedPhotoReviewScreen`) helps tell
+  /// the remaining borderline cases apart before deleting anything.
+  static const double kBlurThreshold = 0.08;
 
   static Future<List<PhotoItem>> scanBlurryPhotos({
     void Function(int current, int total)? onProgress,
@@ -100,6 +109,11 @@ class BlurScanService {
       if (thumbData == null) return null;
 
       final sharpness = ScoringService.computeSharpness(thumbData);
+      // Computed alongside sharpness (same decoded thumbnail, negligible
+      // extra cost) so the review list can show it -- lets you tell a
+      // genuinely blurry photo apart from one that only scored low because
+      // it's bright/overexposed and low-texture.
+      final exposure = ScoringService.computeExposure(thumbData);
 
       return PhotoItem(
         id: asset.id,
@@ -107,6 +121,7 @@ class BlurScanService {
         createDateTime: asset.createDateTime,
         fileSize: await asset.fileSize,
         sharpnessScore: sharpness,
+        exposureScore: exposure,
       );
     } catch (e) {
       debugPrint('[BlurScan] Error scoring ${asset.id}: $e');

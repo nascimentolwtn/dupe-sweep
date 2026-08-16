@@ -17,6 +17,7 @@ import '../utils/byte_formatter.dart';
 import '../widgets/gradient_button.dart';
 import 'duplicate_review_screen.dart';
 import 'flagged_photo_review_screen.dart';
+import 'home_screen.dart';
 
 class ScanProgressScreen extends StatefulWidget {
   final ScanMode mode;
@@ -345,8 +346,17 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
             builder: (_) => FlaggedPhotoReviewScreen(
               mode: ScanMode.blurry,
               photosSelector: (p) => p.blurryPhotos,
-              subtitleBuilder: (photo) =>
-                  'Sharpness: ${((photo.sharpnessScore ?? 0) * 100).toStringAsFixed(0)}%',
+              subtitleBuilder: (photo) {
+                final sharpness =
+                    ((photo.sharpnessScore ?? 0) * 100).toStringAsFixed(0);
+                final exposure = photo.exposureScore;
+                // exposureScore is only populated by the newer scan code
+                // path -- omit the clause entirely for photos scored before
+                // this field existed rather than showing a misleading 0%.
+                if (exposure == null) return 'Sharpness: $sharpness%';
+                return 'Sharpness: $sharpness% · Exposure: '
+                    '${(exposure * 100).toStringAsFixed(0)}%';
+              },
               emptyMessage: 'No blurry photos found.',
             ),
           ),
@@ -453,6 +463,22 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
     });
   }
 
+  /// Every route that lands here does so via `pushReplacement` (a fresh
+  /// scan from `HomeScreen`'s buttons is the only exception, but going
+  /// through `HomeScreen` again is harmless there too) -- so `Navigator.
+  /// pop` has nothing left to pop to on the resume-into-saved-review path
+  /// (`PermissionScreen` -> `DuplicateReviewScreen` -> here via "Re-scan"),
+  /// which otherwise strands the user on this screen with no way back to
+  /// the mode-select menu, even after force-killing the app. Clears the
+  /// whole stack rather than pushing, so repeated visits don't pile up
+  /// HomeScreen copies underneath.
+  void _goHome() {
+    Navigator.of(context).pushAndRemoveUntil(
+      MaterialPageRoute(builder: (_) => const HomeScreen()),
+      (route) => false,
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final provider = context.watch<AppStateProvider>();
@@ -460,6 +486,18 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
     return Scaffold(
       appBar: AppBar(
         title: Text(widget.mode.appBarTitle),
+        // Hidden mid-scan: this screen's async scan methods check `mounted`
+        // before touching state, so navigating away while one is in flight
+        // would silently strand `provider.isScanning` at true instead of
+        // ever reaching finishScan/cancelScan. `_cancelScan` is the correct
+        // way off this screen while scanning.
+        leading: provider.isScanning
+            ? null
+            : IconButton(
+                icon: const Icon(Icons.home),
+                tooltip: 'Home',
+                onPressed: _goHome,
+              ),
       ),
       body: provider.isScanning
           ? Padding(
@@ -506,109 +544,126 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
                 ],
               ),
             )
-          : Padding(
-              padding: const EdgeInsets.all(24.0),
-              child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
-                children: [
-                  ShaderMask(
-                    shaderCallback: (bounds) =>
-                        AppColors.accentGradient.createShader(bounds),
-                    child: const Icon(
-                      Icons.diamond_outlined,
-                      size: 64,
-                      color: Colors.white,
-                    ),
-                  ),
-                  const SizedBox(height: 24),
-                  const Text(
-                    'Ready to Scan',
-                    style: TextStyle(
-                      fontSize: 24,
-                      fontWeight: FontWeight.bold,
-                      color: AppColors.textPrimary,
-                    ),
-                  ),
-                  const SizedBox(height: 16),
-                  Text(
-                    _resumeSummary != null
-                        ? 'A previous scan was interrupted. You can resume '
-                            'where it left off or start over.'
-                        : widget.mode.readyDescription,
-                    textAlign: TextAlign.center,
-                    style: const TextStyle(
-                      fontSize: 16,
-                      color: AppColors.textSecondary,
-                    ),
-                  ),
-                  const SizedBox(height: 32),
-                  if (_isDuplicatesMode &&
-                      _resumeSummary == null &&
-                      !_loadingAlbums &&
-                      _albums.isNotEmpty) ...[
-                    DropdownButtonFormField<AssetPathEntity?>(
-                      initialValue: _selectedAlbum,
-                      // Without this, the dropdown button's Row (selected
-                      // item + arrow icon) sizes to its content's intrinsic
-                      // width instead of the available width -- so the
-                      // DropdownMenuItem children's `overflow:
-                      // TextOverflow.ellipsis` never has a width constraint
-                      // to actually clip against, and a long album name
-                      // pushes the Row past the field's bounds (Flutter's
-                      // debug-mode "RIGHT OVERFLOWED BY N PIXELS" banner).
-                      // isExpanded makes the button and its items fill the
-                      // field's width so ellipsis has something to clip to.
-                      isExpanded: true,
-                      decoration: const InputDecoration(
-                        labelText: 'Album',
-                        border: OutlineInputBorder(),
-                      ),
-                      items: [
-                        const DropdownMenuItem<AssetPathEntity?>(
-                          value: null,
-                          child: Text(
-                            'All Photos',
-                            overflow: TextOverflow.ellipsis,
+          : LayoutBuilder(
+              builder: (context, constraints) => SingleChildScrollView(
+                // Ready-to-scan content (icon, description, album dropdown,
+                // resume/start buttons) was in a plain centered Column with
+                // no scroll wrapper -- fine most of the time, but a long
+                // album name list, larger system font scaling, or a short
+                // landscape viewport can push it past the available height
+                // and clip the Start Scan button with no way to reach it.
+                // ConstrainedBox keeps the Column vertically centered when
+                // everything fits, and only turns scrollable once it
+                // doesn't.
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(minHeight: constraints.maxHeight),
+                  child: Padding(
+                    padding: const EdgeInsets.all(24.0),
+                    child: Column(
+                      mainAxisAlignment: MainAxisAlignment.center,
+                      children: [
+                        ShaderMask(
+                          shaderCallback: (bounds) =>
+                              AppColors.accentGradient.createShader(bounds),
+                          child: const Icon(
+                            Icons.diamond_outlined,
+                            size: 64,
+                            color: Colors.white,
                           ),
                         ),
-                        ..._albums.map(
-                          (a) => DropdownMenuItem<AssetPathEntity?>(
-                            value: a,
-                            child:
-                                Text(a.name, overflow: TextOverflow.ellipsis),
+                        const SizedBox(height: 24),
+                        const Text(
+                          'Ready to Scan',
+                          style: TextStyle(
+                            fontSize: 24,
+                            fontWeight: FontWeight.bold,
+                            color: AppColors.textPrimary,
                           ),
                         ),
+                        const SizedBox(height: 16),
+                        Text(
+                          _resumeSummary != null
+                              ? 'A previous scan was interrupted. You can resume '
+                                  'where it left off or start over.'
+                              : widget.mode.readyDescription,
+                          textAlign: TextAlign.center,
+                          style: const TextStyle(
+                            fontSize: 16,
+                            color: AppColors.textSecondary,
+                          ),
+                        ),
+                        const SizedBox(height: 32),
+                        if (_isDuplicatesMode &&
+                            _resumeSummary == null &&
+                            !_loadingAlbums &&
+                            _albums.isNotEmpty) ...[
+                          DropdownButtonFormField<AssetPathEntity?>(
+                            initialValue: _selectedAlbum,
+                            // Without this, the dropdown button's Row (selected
+                            // item + arrow icon) sizes to its content's intrinsic
+                            // width instead of the available width -- so the
+                            // DropdownMenuItem children's `overflow:
+                            // TextOverflow.ellipsis` never has a width constraint
+                            // to actually clip against, and a long album name
+                            // pushes the Row past the field's bounds (Flutter's
+                            // debug-mode "RIGHT OVERFLOWED BY N PIXELS" banner).
+                            // isExpanded makes the button and its items fill the
+                            // field's width so ellipsis has something to clip to.
+                            isExpanded: true,
+                            decoration: const InputDecoration(
+                              labelText: 'Album',
+                              border: OutlineInputBorder(),
+                            ),
+                            items: [
+                              const DropdownMenuItem<AssetPathEntity?>(
+                                value: null,
+                                child: Text(
+                                  'All Photos',
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                              ..._albums.map(
+                                (a) => DropdownMenuItem<AssetPathEntity?>(
+                                  value: a,
+                                  child: Text(a.name,
+                                      overflow: TextOverflow.ellipsis),
+                                ),
+                              ),
+                            ],
+                            onChanged: (value) =>
+                                setState(() => _selectedAlbum = value),
+                          ),
+                          const SizedBox(height: 20),
+                        ],
+                        if (_checkingResume)
+                          const SizedBox(
+                            height: 20,
+                            width: 20,
+                            child: CircularProgressIndicator(strokeWidth: 2),
+                          )
+                        else if (_resumeSummary != null) ...[
+                          GradientButton(
+                            onPressed: () => _startScan(resume: true),
+                            icon: Icons.play_arrow,
+                            label:
+                                'Resume scan (${_resumeSummary!.processedCount}/'
+                                '${_resumeSummary!.totalKnownAssets} done)',
+                          ),
+                          const SizedBox(height: 12),
+                          TextButton(
+                            onPressed: _confirmStartOver,
+                            child: const Text('Start over'),
+                          ),
+                        ] else
+                          GradientButton(
+                            onPressed: () => _startScan(),
+                            icon: Icons.search,
+                            label: 'Start Scan',
+                          ),
                       ],
-                      onChanged: (value) =>
-                          setState(() => _selectedAlbum = value),
                     ),
-                    const SizedBox(height: 20),
-                  ],
-                  if (_checkingResume)
-                    const SizedBox(
-                      height: 20,
-                      width: 20,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  else if (_resumeSummary != null) ...[
-                    GradientButton(
-                      onPressed: () => _startScan(resume: true),
-                      icon: Icons.play_arrow,
-                      label: 'Resume scan (${_resumeSummary!.processedCount}/'
-                          '${_resumeSummary!.totalKnownAssets} done)',
-                    ),
-                    const SizedBox(height: 12),
-                    TextButton(
-                      onPressed: _confirmStartOver,
-                      child: const Text('Start over'),
-                    ),
-                  ] else
-                    GradientButton(
-                      onPressed: () => _startScan(),
-                      icon: Icons.search,
-                      label: 'Start Scan',
-                    ),
-                ],
+                  ),
+                ),
               ),
             ),
     );
