@@ -142,12 +142,15 @@ class HomeScreen extends StatelessWidget {
           // Pinned to the bottom via Positioned (rather than sitting in the
           // centered Column above) so it stays put in the same corner
           // regardless of how much space the menu content above ends up
-          // taking.
-          const Positioned(
+          // taking. Adds the system nav bar's inset -- same reasoning as
+          // SummaryBar/FlaggedPhotoSummaryBar -- so it doesn't render
+          // underneath the gesture-nav pill / 3-button nav on real devices,
+          // which without this made the label effectively invisible.
+          Positioned(
             left: 0,
             right: 0,
-            bottom: 12,
-            child: Center(
+            bottom: 12 + MediaQuery.of(context).padding.bottom,
+            child: const Center(
               child: Text(
                 'v$kAppVersion',
                 style: TextStyle(
