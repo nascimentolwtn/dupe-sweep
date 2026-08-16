@@ -202,15 +202,18 @@ remote machine — no server or new dependency is installed there, just the
 `sshd` it's already reachable through.
 - `remote_client.py` — SSH/SFTP connect, recursive remote walks
   (`list_images` for photos, `list_files` for every file), folder-picker
-  listing (`list_subdirs`), move-to-`_to_delete` with collision handling
-  (`move_to_trash`), recursive same-disk relocation for archive mode
-  (`move_tree`). Cleanup of `_to_delete` folders (`find_trash_dirs`,
-  `count_trash`, `purge_trash`, `restore_trash`) and full-file reads
-  (`read_bytes`) run over **native SSH exec** (`find`/`rm`/`du`/`cat`), not
-  SFTP — walking a large root directory-by-directory over SFTP
-  (`listdir_attr` = one round trip per directory) took minutes on the real
-  netbook; the netbook's own `find` does it in seconds. SFTP stays for
-  browsing and scan/archive discovery (folder-scoped, not drive-wide) and
+  listing (`list_subdirs`), full-file reads (`read_bytes`), move-to-
+  `_to_delete` with collision handling (`move_to_trash`), recursive
+  same-disk relocation for archive mode (`move_tree`). Cleanup of
+  `_to_delete` folders (`find_trash_dirs`, `count_trash`, `purge_trash`,
+  `restore_trash`'s discovery step) runs over **native SSH exec**
+  (`find`/`rm`/`du`), not SFTP — walking a large root directory-by-directory
+  over SFTP (`listdir_attr` = one round trip per directory) took minutes on
+  the real netbook; the netbook's own `find` does it in seconds. SFTP stays
+  for browsing, scan/archive discovery (folder-scoped, not drive-wide),
+  bulk full-file reads (`read_bytes` — a `cat`-over-exec version of this
+  briefly existed and was reverted: SSH channels have a ~2MB flow-control
+  window, and any photo bigger than that deadlocked the exec channel), and
   per-file rename/collision handling (fine-grained, doesn't fit a bulk
   shell command).
 - `scan_remote.py` — staged, threaded, resumable hash → cluster → score →

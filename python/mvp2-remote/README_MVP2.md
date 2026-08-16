@@ -28,12 +28,14 @@ the Dart app).
   interactive, exactly what SFTP is good at), recursive walks
   (`list_images()` for photos only, `list_files()` for every file, still
   SFTP since these are scoped to one scan/archive folder at a time),
+  `read_bytes()` (bulk full-file reads, SFTP with `.prefetch()`),
   `move_to_trash()` (move-not-delete, with a `_1`/`_2` collision suffix
   instead of overwriting), `move_tree()` (recursive same-disk relocation
-  for archive mode, see below). `read_bytes()` and
-  `find_trash_dirs()`/`count_trash()`/`purge_trash()`/`restore_trash()` (see
-  Purge/restore mode below) run over **native SSH exec** (`cat`/`find`/
-  `rm`/`du`) instead of SFTP — see "Why native SSH exec, not SFTP" below.
+  for archive mode, see below). `find_trash_dirs()`/`count_trash()`/
+  `purge_trash()`/`restore_trash()` (see Purge/restore mode below) run over
+  **native SSH exec** (`find`/`rm`/`du`) instead of SFTP — see "Why native
+  SSH exec, not SFTP" below (and why `read_bytes()` deliberately does
+  *not* use it, despite an earlier version doing exactly that).
 - `scan_remote.py` — the heavy lifting: hashes + EXIF-timestamps every image
   found (`hash_cache.json`), clusters by time proximity then visual
   similarity, then scores sharpness/exposure (`score_cache.json`) and
@@ -77,6 +79,7 @@ the Dart app).
   elapsed time and an estimated time remaining for the current stage, based
   on how fast this run's own progress is going (a resumed scan with a lot
   already cached doesn't skew the estimate).
+- `requirements.txt` — `pillow`, `imagehash`, `numpy`, `paramiko`, `flask`, `piexif`.
 
 All SFTP/SSH calls from the Flask app share one connection, serialized
 behind a lock (`_sftp_call`/`_ssh_call`/`_remote_call` in
@@ -87,20 +90,37 @@ Compare mode loading two full-res photos at once) could otherwise wedge the
 shared channel rather than just error. This only serializes remote I/O, not
 the whole request.
 
-## Why native SSH exec, not SFTP, for purge/restore/read
+## Why native SSH exec, not SFTP, for purge/restore -- but NOT for read_bytes
 
-`find_trash_dirs()`, `count_trash()`, `purge_trash()`, `restore_trash()`,
-and `read_bytes()` run `find`/`rm`/`du`/`cat` over a plain SSH exec channel
-instead of SFTP. This mattered in practice: purging `_to_delete` folders
-across a large root (the whole `/media/backup` browse root, not just one
-photo folder — which on a real backup drive can include a lot that isn't
-photos, e.g. `DVDTemp/HD_Games/Backups/...`) took **minutes** walking it
+`find_trash_dirs()`, `count_trash()`, `purge_trash()`, and `restore_trash()`'s
+folder discovery run `find`/`rm`/`du` over a plain SSH exec channel instead
+of SFTP. This mattered in practice: purging `_to_delete` folders across a
+large root (the whole `/media/backup` browse root, not just one photo
+folder — which on a real backup drive can include a lot that isn't photos,
+e.g. `DVDTemp/HD_Games/Backups/...`) took **minutes** walking it
 directory-by-directory over SFTP (`listdir_attr()` is one SSH round trip
 *per directory*), versus **seconds** for the netbook's own `find` running
-natively against its own filesystem in one shot. `read_bytes()` (used by
-`/raw` for the lightbox/Compare full-resolution fetch) also moved to `cat`
-over exec — it skips SFTP's per-packet request/response framing for what's
-otherwise just a bulk sequential byte stream.
+natively against its own filesystem in one shot.
+
+`read_bytes()` briefly moved to exec (`cat`) too, on the theory that it'd
+skip SFTP's per-packet framing for a bulk sequential read. **It doesn't
+work, and shouldn't be reintroduced**: SSH channels are flow-controlled by
+a receive window (paramiko's default is 2MB), refilled only when something
+actually reads from the channel. `cat`ing a photo bigger than that window
+blocks the remote `cat` on its own stdout write before it can exit, and
+`recv_exit_status()` blocks right back waiting for an exit status that will
+never come — a real deadlock (paramiko's own docstring warns about exactly
+this), hit by any full-resolution photo over ~2MB, which is most of them.
+It surfaced as intermittent freezes opening the lightbox or Compare (which
+`read_bytes()` backs via `/raw`), worse than it sounds because `/raw` runs
+under the same lock as every other remote call (`_sftp_call`/`_ssh_call`/
+`_remote_call`, see below) — one stuck fetch froze the whole app, not just
+that photo. `read_bytes()` is back on SFTP with `.prefetch()`, which
+pipelines a bulk read just as well and has no window-deadlock class of bug.
+`_exec()` itself was also hardened (drain stdout/stderr fully before
+`recv_exit_status()`, always close the channel) for the commands that do
+still use it, even though none of `find`/`rm`/`du`'s output is anywhere
+near 2MB in practice.
 
 SFTP is kept for:
 - **Browsing** (`list_subdirs()`) — cheap, one level at a time, and
@@ -112,6 +132,7 @@ SFTP is kept for:
   changing them would mean re-deriving size/mtime via `find -printf`
   instead of SFTP's structured attributes — a larger change than what was
   actually slow).
+- **Bulk full-file reads** (`read_bytes()`) — see above.
 - **Per-file rename/collision handling** (`move_to_trash()`, `move_tree()`,
   and `restore_trash()`'s actual moves) — fine-grained, stateful logic
   (`_1`/`_2` suffix on a name collision) that doesn't fit a bulk shell
@@ -119,7 +140,6 @@ SFTP is kept for:
   never the bottleneck. `restore_trash()` is a hybrid: native `find` for
   discovering `_to_delete` folders and their contents, SFTP for the actual
   per-file rename.
-- `requirements.txt` — `pillow`, `imagehash`, `numpy`, `paramiko`, `flask`, `piexif`.
 
 ## Prerequisites
 

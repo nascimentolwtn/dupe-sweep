@@ -95,6 +95,23 @@ def _connect_sftp():
     _sftp_client = _ssh_client.open_sftp()
 
 
+def _reset_connection():
+    """Drop the shared connection so the next call reconnects. Closes the
+    old SSHClient/SFTPClient first -- paramiko's Transport is a running
+    daemon thread that holds a reference to itself, so just reassigning the
+    globals to None leaks a live authenticated connection (socket + thread)
+    forever; every reconnect without this leaked one permanently."""
+    global _ssh_client, _sftp_client
+    for c in (_sftp_client, _ssh_client):
+        if c is not None:
+            try:
+                c.close()
+            except Exception:
+                pass
+    _sftp_client = None
+    _ssh_client = None
+
+
 def _sftp_call(fn):
     """Call fn(sftp) against the shared connection, serialized behind
     _client_lock for the WHOLE call (not just the connect step) --
@@ -104,37 +121,34 @@ def _sftp_call(fn):
     SFTPClient can wedge the underlying channel rather than just raising.
     On a transport error (netbook napped, connection dropped), reconnect
     once and retry, still under the lock."""
-    global _ssh_client, _sftp_client
+    global _sftp_client
     with _client_lock:
         if _sftp_client is None:
             _connect_sftp()
         try:
             return fn(_sftp_client)
         except (IOError, EOFError, paramiko.SSHException):
-            _sftp_client = None
-            _ssh_client = None
+            _reset_connection()
             _connect_sftp()
             return fn(_sftp_client)
 
 
 def _ssh_call(fn):
     """Like _sftp_call but hands fn the underlying SSHClient instead of an
-    SFTP session, for native find/rm/du/cat exec commands (see
-    remote_client.find_trash_dirs/count_trash/purge_trash/read_bytes) --
-    dramatically faster than SFTP's per-item round trips for whole-tree
-    operations like purge/restore, which used to take minutes walking a
-    large root directory by directory. Shares the same connection/lock/
-    reconnect logic as _sftp_call (both ride the same underlying
-    connection)."""
-    global _ssh_client, _sftp_client
+    SFTP session, for native find/rm/du exec commands (see
+    remote_client.find_trash_dirs/count_trash/purge_trash) -- dramatically
+    faster than SFTP's per-item round trips for whole-tree operations like
+    purge/restore, which used to take minutes walking a large root
+    directory by directory. Shares the same connection/lock/reconnect logic
+    as _sftp_call (both ride the same underlying connection)."""
+    global _ssh_client
     with _client_lock:
         if _ssh_client is None:
             _connect_sftp()
         try:
             return fn(_ssh_client)
         except (IOError, EOFError, paramiko.SSHException):
-            _sftp_client = None
-            _ssh_client = None
+            _reset_connection()
             _connect_sftp()
             return fn(_ssh_client)
 
@@ -151,8 +165,7 @@ def _remote_call(fn):
         try:
             return fn(_sftp_client, _ssh_client)
         except (IOError, EOFError, paramiko.SSHException):
-            _sftp_client = None
-            _ssh_client = None
+            _reset_connection()
             _connect_sftp()
             return fn(_sftp_client, _ssh_client)
 
@@ -1416,7 +1429,7 @@ def raw():
     if not path:
         abort(400)
     try:
-        data = _ssh_call(lambda client: remote_client.read_bytes(client, path))
+        data = _sftp_call(lambda sftp: remote_client.read_bytes(sftp, path))
     except Exception:
         abort(404)
     ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""

@@ -26,17 +26,34 @@ TRASH_DIRNAME = "_to_delete"
 def _exec(client, cmd, timeout=120):
     """Run `cmd` on the remote host via SSH exec (not SFTP) and return
     (stdout_bytes, stderr_text, exit_code). Used for whole-tree operations
-    (find/rm/du) and bulk file reads (cat) -- these are dramatically faster
-    than SFTP's per-item request/response round trips: a `find` under a
-    large tree (e.g. purge/restore scanning for _to_delete folders) runs
-    natively on the netbook's own filesystem in one shot instead of
-    thousands of individual listdir_attr() calls over SFTP, one per
-    directory. SFTP is kept for folder *browsing* (list_subdirs, cheap and
-    interactive) and for the fine-grained per-file rename/collision
-    handling that move_to_trash/restore_trash/move_tree need."""
+    (find/rm/du) -- dramatically faster than SFTP's per-item request/
+    response round trips: a `find` under a large tree (e.g. purge/restore
+    scanning for _to_delete folders) runs natively on the netbook's own
+    filesystem in one shot instead of thousands of individual
+    listdir_attr() calls over SFTP, one per directory. SFTP is kept for
+    folder *browsing* (list_subdirs, cheap and interactive), bulk file
+    reads (read_bytes, below), and the fine-grained per-file rename/
+    collision handling that move_to_trash/restore_trash/move_tree need.
+
+    MUST drain stdout/stderr before calling recv_exit_status(): SSH
+    channels are flow-controlled by a receive window (paramiko's default is
+    2MB), replenished only when something actually reads. A remote command
+    that writes more than the window before exiting blocks on that write
+    forever if nobody's reading yet -- and recv_exit_status() blocks
+    forever right back, with no regard for the `timeout` passed to
+    exec_command (paramiko's own docstring warns about exactly this). Safe
+    here because every _exec() caller's output is small (found paths, a
+    number from wc/du) -- never route a bulk file read through this."""
     _in, out, err = client.exec_command(cmd, timeout=timeout)
-    rc = out.channel.recv_exit_status()
-    return out.read(), err.read().decode("utf-8", errors="replace"), rc
+    chan = out.channel
+    try:
+        _in.close()
+        data = out.read()
+        errtext = err.read().decode("utf-8", errors="replace")
+        rc = chan.recv_exit_status()  # safe now -- the command has already exited
+        return data, errtext, rc
+    finally:
+        chan.close()
 
 
 def connect(host, port=22, username=None, key_filename=None, password=None):
@@ -134,17 +151,22 @@ def list_files(sftp, root):
         yield {"path": full, "size": entry.st_size, "mtime": entry.st_mtime}
 
 
-def read_bytes(client, remote_path):
-    """Read a whole remote file via SSH exec (`cat`) instead of SFTP --
-    streams raw bytes straight over the exec channel, skipping SFTP's
-    per-packet request/response framing, which matters for the multi-MB
-    full-resolution reads the review page's lightbox/Compare view do on top
-    of a slow netbook. Raises IOError (with the remote `cat`'s stderr) if
-    the file doesn't exist or isn't readable."""
-    data, err, rc = _exec(client, f"cat {shlex.quote(str(remote_path))}")
-    if rc != 0:
-        raise IOError(err.strip() or f"cat failed (exit {rc})")
-    return data
+def read_bytes(sftp, remote_path):
+    """Read a whole remote file into memory, with .prefetch() so paramiko
+    pulls it in one bulk transfer instead of chunked one-round-trip-at-a-time
+    reads.
+
+    SFTP, not exec+cat: a `cat`'d full-resolution photo (multi-MB) routed
+    through _exec() deadlocked -- exec channels are flow-controlled by a
+    ~2MB receive window, and _exec() used to call recv_exit_status() before
+    draining stdout, so anything larger than the window wedged forever (see
+    _exec()'s docstring). SFTP's read path has no such trap and, with
+    prefetch(), pipelines just as well for a single bulk file read -- the
+    exec/cat detour never bought anything here; it only matters for
+    whole-tree find/rm/du, where the payload is small."""
+    with sftp.open(str(remote_path), "rb") as f:
+        f.prefetch()
+        return f.read()
 
 
 def _exists(sftp, path):
@@ -259,6 +281,69 @@ def move_tree(sftp, src_root, dst_root, min_age_seconds=300, date_from=None, dat
         "skipped_collision_renamed": skipped_collision_renamed,
         "errors": errors,
     }
+
+
+def _sanitize_event_name(name):
+    """Folder-name-safe version of a user-edited event name: strips
+    surrounding whitespace/slashes and collapses embedded slashes so it
+    can't escape dest_root or create unintended subfolders."""
+    name = name.strip().strip("/")
+    name = name.replace("/", "_")
+    return name or "Untitled"
+
+
+def move_grouped(sftp, events, dest_root, min_age_seconds=300):
+    """Same-disk move like move_tree(), but destinations are explicit named
+    groups instead of one recursive relative-structure mirror: `events` is
+    a list of {"name": str, "paths": [remote_path, ...]} -- the final,
+    user-edited event groupings from archive mode's "group into events"
+    review UI. Each event's files land in dest_root/<sanitized name>/;
+    two events sanitizing to the same name simply share that destination
+    folder, no special-casing needed. Same still-syncing guard,
+    collision-suffix safety, and move-not-delete guarantee as move_tree().
+    Returns a list of per-event summary dicts."""
+    dest_root = str(dest_root).rstrip("/")
+    now = time.time()
+
+    summaries = []
+    for event in events:
+        dest_dir = f"{dest_root}/{_sanitize_event_name(event['name'])}"
+        moved = 0
+        moved_bytes = 0
+        skipped_recent = 0
+        skipped_collision_renamed = 0
+        errors = []
+        for path in event["paths"]:
+            try:
+                info = sftp.stat(path)
+            except IOError as e:
+                errors.append((path, str(e)))
+                continue
+            if now - info.st_mtime < min_age_seconds:
+                skipped_recent += 1
+                continue
+            name = path.rsplit("/", 1)[-1]
+            dest = f"{dest_dir}/{name}"
+            try:
+                _ensure_dir(sftp, dest_dir)
+                final_dest = _resolve_collision(sftp, dest)
+                if final_dest != dest:
+                    skipped_collision_renamed += 1
+                sftp.rename(path, final_dest)
+                moved += 1
+                moved_bytes += info.st_size
+            except Exception as e:
+                errors.append((path, str(e)))
+        summaries.append({
+            "name": event["name"],
+            "dest": dest_dir,
+            "moved": moved,
+            "moved_bytes": moved_bytes,
+            "skipped_recent": skipped_recent,
+            "skipped_collision_renamed": skipped_collision_renamed,
+            "errors": errors,
+        })
+    return summaries
 
 
 def find_trash_dirs(client, root):

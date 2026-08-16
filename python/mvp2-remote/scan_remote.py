@@ -60,7 +60,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from PIL import Image, ImageOps
 import imagehash
@@ -74,6 +74,13 @@ HASH_DISTANCE = 10
 THUMB_MAX_DIM = 280
 THUMB_QUALITY = 60
 SAVE_EVERY = 20  # cache-flush + progress-report cadence within a stage
+
+# Archive mode's "group into events" flow: default gap between consecutive
+# photo timestamps before starting a new event. Much coarser than
+# TIME_WINDOW (which detects duplicate-shot bursts seconds apart) --
+# tuned for splitting apart unrelated trips/occasions, not near-identical
+# frames. Adjustable live in the review UI; this is only the initial value.
+EVENT_GAP_SECONDS = 12 * 3600
 
 # Most camera/phone JPEGs embed a small preview thumbnail (commonly ~160x120,
 # a few KB) inside the EXIF APP1 marker, which the JPEG spec caps at 65533
@@ -100,7 +107,12 @@ DATETIME_TOPLEVEL_TAG = 306  # "DateTime" (modify date) on IFD0, fallback only
 class ConnectionPool:
     """One SSHClient/SFTPClient per worker thread, created lazily and reused
     across that thread's tasks (opening a fresh SSH connection per file
-    would be far more expensive than the file transfer itself)."""
+    would be far more expensive than the file transfer itself). Each stage
+    in run_scan() gets its own ThreadPoolExecutor (fresh threads), so a
+    single scan can rack up several connections; call close() when the scan
+    is done so they don't leak (SSHClient has no __del__, and paramiko's
+    Transport is a running daemon thread holding a reference to itself, so
+    an abandoned connection is never garbage-collected on its own)."""
 
     def __init__(self, host, port, username, key_filename, password):
         self.host = host
@@ -109,22 +121,28 @@ class ConnectionPool:
         self.key_filename = key_filename
         self.password = password
         self._local = threading.local()
+        self._all_clients = []
+        self._all_lock = threading.Lock()
 
     def get_sftp(self):
         if not hasattr(self._local, "sftp"):
             client = remote_client.connect(
                 self.host, self.port, self.username, self.key_filename, self.password
             )
+            with self._all_lock:
+                self._all_clients.append(client)
             self._local.client = client
             self._local.sftp = client.open_sftp()
         return self._local.sftp
 
-    def get_client(self):
-        """The underlying SSHClient for this thread's connection (for
-        native exec commands like remote_client.read_bytes's `cat`, faster
-        than SFTP for bulk full-file reads)."""
-        self.get_sftp()  # ensures the connection is established
-        return self._local.client
+    def close(self):
+        with self._all_lock:
+            clients, self._all_clients = self._all_clients, []
+        for c in clients:
+            try:
+                c.close()
+            except Exception:
+                pass
 
 
 def cluster_by_time(items, window_seconds: int):
@@ -160,6 +178,25 @@ def split_by_similarity(cluster, hash_distance: int):
         if not placed:
             groups.append([item])
     return [g for g in groups if len(g) > 1]
+
+
+def cluster_events(items, gap_seconds):
+    """Same sort-and-split logic as cluster_by_time(), but keeps singleton
+    clusters. cluster_by_time() drops lone items because a single photo
+    can't be a duplicate of anything -- wrong here, since every photo in
+    an archive-mode folder must end up in some event, not get silently
+    dropped."""
+    items = sorted(items, key=lambda x: x["ts"])
+    clusters = []
+    current = []
+    for item in items:
+        if current and (item["ts"] - current[-1]["ts"]).total_seconds() > gap_seconds:
+            clusters.append(current)
+            current = []
+        current.append(item)
+    if current:
+        clusters.append(current)
+    return clusters
 
 
 def _read_prefix(sftp, remote_path, n):
@@ -237,7 +274,7 @@ def _hash_worker(pool, file_info, remote_path):
                 phash = None
 
         if phash is None:
-            full_data = prefix if is_whole_file else remote_client.read_bytes(pool.get_client(), remote_path)
+            full_data = prefix if is_whole_file else remote_client.read_bytes(sftp, remote_path)
             with Image.open(io.BytesIO(full_data)) as img:
                 # draft() only helps JPEGs and only reduces decode scale,
                 # never increases it beyond the source size, so it's always
@@ -251,11 +288,29 @@ def _hash_worker(pool, file_info, remote_path):
     return {"ts": ts.isoformat(), "hash": str(phash) if phash is not None else None, "size": info["size"]}
 
 
+def _ts_worker(pool, file_info, remote_path):
+    """Like _hash_worker but skips the perceptual-hash computation --
+    archive mode's event clustering only needs a timestamp, not a
+    similarity hash, so this is cheaper per photo."""
+    info = file_info[remote_path]
+    sftp = pool.get_sftp()
+    ts = None
+    try:
+        prefix, _is_whole_file = _read_prefix(sftp, remote_path, HASH_PREFIX_BYTES)
+        with Image.open(io.BytesIO(prefix)) as hdr_img:
+            ts = _exif_timestamp(hdr_img.getexif())
+    except Exception:
+        pass
+    if ts is None:
+        ts = datetime.fromtimestamp(info["mtime"])
+    return {"ts": ts.isoformat(), "size": info["size"]}
+
+
 def _score_worker(pool, remote_path):
     """Sharpness (Laplacian variance) + exposure penalty from a single
     remote read, mirroring python-mvp1's score_photo()."""
     try:
-        data = remote_client.read_bytes(pool.get_client(), remote_path)
+        data = remote_client.read_bytes(pool.get_sftp(), remote_path)
         with Image.open(io.BytesIO(data)) as img:
             img.draft("L", (512, 512))
             gray = np.asarray(img.convert("L").resize((512, 512)), dtype=np.float64)
@@ -283,7 +338,7 @@ def _score_worker(pool, remote_path):
 def _thumb_worker(pool, remote_path):
     """Mirrors python-mvp1/build_review_html.py's make_thumb_b64()."""
     try:
-        data = remote_client.read_bytes(pool.get_client(), remote_path)
+        data = remote_client.read_bytes(pool.get_sftp(), remote_path)
         with Image.open(io.BytesIO(data)) as img:
             img.draft("RGB", (THUMB_MAX_DIM * 2, THUMB_MAX_DIM * 2))
             img = ImageOps.exif_transpose(img)
@@ -373,54 +428,123 @@ def run_scan(remote_folder, out_dir, *, host, port=22, username=None,
     thumb_cache_path = out_dir / "thumb_cache.json"
 
     pool = ConnectionPool(host, port, username, key_filename, password)
+    try:
+        sftp = pool.get_sftp()
+
+        if progress_cb:
+            progress_cb("listing", 0, 0)
+        file_info = {d["path"]: d for d in remote_client.list_images(sftp, remote_folder)}
+        paths = list(file_info.keys())
+        if progress_cb:
+            progress_cb("listing", len(paths), len(paths))
+        print(f"Found {len(paths)} image files under {remote_folder}.")
+
+        hash_cache, hash_done = _run_cached_stage(
+            paths, hash_cache_path, functools.partial(_hash_worker, pool, file_info),
+            workers=workers, max_seconds=max_seconds, progress_cb=progress_cb,
+            stage_name="hashing",
+        )
+        if not hash_done:
+            return {"status": "incomplete", "stage": "hashing"}
+
+        items = []
+        for p in paths:
+            e = hash_cache[p]
+            items.append({
+                "path": p,
+                "ts": datetime.fromisoformat(e["ts"]),
+                "hash": imagehash.hex_to_hash(e["hash"]) if e["hash"] else None,
+                "size": e["size"],
+            })
+
+        time_clusters = cluster_by_time(items, time_window)
+        all_groups = []
+        for tc in time_clusters:
+            all_groups.extend(split_by_similarity(tc, hash_distance))
+        grouped_paths = sorted({item["path"] for g in all_groups for item in g})
+        print(f"{len(all_groups)} duplicate groups, {len(grouped_paths)} photos need scoring/thumbnailing.")
+
+        if progress_cb:
+            progress_cb("grouping", len(grouped_paths), len(grouped_paths))
+
+        score_cache, score_done = _run_cached_stage(
+            grouped_paths, score_cache_path, functools.partial(_score_worker, pool),
+            workers=workers, max_seconds=max_seconds, progress_cb=progress_cb,
+            stage_name="scoring",
+        )
+        if not score_done:
+            return {"status": "incomplete", "stage": "scoring"}
+
+        thumb_cache, thumb_done = _run_cached_stage(
+            grouped_paths, thumb_cache_path, functools.partial(_thumb_worker, pool),
+            workers=workers, max_seconds=max_seconds, progress_cb=progress_cb,
+            stage_name="thumbnailing",
+        )
+        if not thumb_done:
+            return {"status": "incomplete", "stage": "thumbnailing"}
+
+        if progress_cb:
+            progress_cb("done", len(grouped_paths), len(grouped_paths))
+        return {
+            "status": "complete",
+            "total_images": len(paths),
+            "groups": len(all_groups),
+            "grouped_photos": len(grouped_paths),
+        }
+    finally:
+        # Each stage above ran its own ThreadPoolExecutor (fresh worker
+        # threads = fresh connections in this pool) -- close them all now
+        # rather than leaking a live SSH connection + thread per stage on
+        # every scan/rescan.
+        pool.close()
+
+
+def scan_events(remote_folder, out_dir, *, host, port=22, username=None,
+                 key_filename=None, password=None,
+                 workers=4, max_seconds=None, progress_cb=None):
+    """Staged pipeline for archive mode's "group into events" flow: lists
+    every file under remote_folder (photos and everything else alike), gets
+    a timestamp for every photo (EXIF, falling back to mtime -- see
+    _ts_worker), and thumbnails every photo, not just ones in a duplicate
+    group like run_scan() does, since every photo needs to be visible in
+    the event review grid. Non-photo files need no network read at all:
+    their mtime already came back for free from the directory listing.
+
+    Writes/resumes event_ts_cache.json and event_thumb_cache.json under
+    out_dir -- kept separate from run_scan()'s hash/score/thumb caches so
+    the two features' cache files don't get entangled. Same
+    resumable-by-rerunning contract as run_scan(): a dropped connection or
+    --max-seconds cutoff just means calling this again."""
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    ts_cache_path = out_dir / "event_ts_cache.json"
+    thumb_cache_path = out_dir / "event_thumb_cache.json"
+
+    pool = ConnectionPool(host, port, username, key_filename, password)
     sftp = pool.get_sftp()
 
     if progress_cb:
         progress_cb("listing", 0, 0)
-    file_info = {d["path"]: d for d in remote_client.list_images(sftp, remote_folder)}
-    paths = list(file_info.keys())
+    all_files = list(remote_client.list_files(sftp, remote_folder))
+    file_info = {f["path"]: f for f in all_files}
+    image_paths = [
+        f["path"] for f in all_files
+        if PurePosixPath(f["path"]).suffix.lower() in remote_client.IMAGE_EXTS
+    ]
     if progress_cb:
-        progress_cb("listing", len(paths), len(paths))
-    print(f"Found {len(paths)} image files under {remote_folder}.")
+        progress_cb("listing", len(all_files), len(all_files))
+    print(f"Found {len(all_files)} files ({len(image_paths)} images) under {remote_folder}.")
 
-    hash_cache, hash_done = _run_cached_stage(
-        paths, hash_cache_path, functools.partial(_hash_worker, pool, file_info),
+    ts_cache, ts_done = _run_cached_stage(
+        image_paths, ts_cache_path, functools.partial(_ts_worker, pool, file_info),
         workers=workers, max_seconds=max_seconds, progress_cb=progress_cb,
-        stage_name="hashing",
+        stage_name="timestamps",
     )
-    if not hash_done:
-        return {"status": "incomplete", "stage": "hashing"}
-
-    items = []
-    for p in paths:
-        e = hash_cache[p]
-        items.append({
-            "path": p,
-            "ts": datetime.fromisoformat(e["ts"]),
-            "hash": imagehash.hex_to_hash(e["hash"]) if e["hash"] else None,
-            "size": e["size"],
-        })
-
-    time_clusters = cluster_by_time(items, time_window)
-    all_groups = []
-    for tc in time_clusters:
-        all_groups.extend(split_by_similarity(tc, hash_distance))
-    grouped_paths = sorted({item["path"] for g in all_groups for item in g})
-    print(f"{len(all_groups)} duplicate groups, {len(grouped_paths)} photos need scoring/thumbnailing.")
-
-    if progress_cb:
-        progress_cb("grouping", len(grouped_paths), len(grouped_paths))
-
-    score_cache, score_done = _run_cached_stage(
-        grouped_paths, score_cache_path, functools.partial(_score_worker, pool),
-        workers=workers, max_seconds=max_seconds, progress_cb=progress_cb,
-        stage_name="scoring",
-    )
-    if not score_done:
-        return {"status": "incomplete", "stage": "scoring"}
+    if not ts_done:
+        return {"status": "incomplete", "stage": "timestamps"}
 
     thumb_cache, thumb_done = _run_cached_stage(
-        grouped_paths, thumb_cache_path, functools.partial(_thumb_worker, pool),
+        image_paths, thumb_cache_path, functools.partial(_thumb_worker, pool),
         workers=workers, max_seconds=max_seconds, progress_cb=progress_cb,
         stage_name="thumbnailing",
     )
@@ -428,12 +552,11 @@ def run_scan(remote_folder, out_dir, *, host, port=22, username=None,
         return {"status": "incomplete", "stage": "thumbnailing"}
 
     if progress_cb:
-        progress_cb("done", len(grouped_paths), len(grouped_paths))
+        progress_cb("done", len(image_paths), len(image_paths))
     return {
         "status": "complete",
-        "total_images": len(paths),
-        "groups": len(all_groups),
-        "grouped_photos": len(grouped_paths),
+        "total_files": len(all_files),
+        "image_files": len(image_paths),
     }
 
 
