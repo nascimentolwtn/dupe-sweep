@@ -381,7 +381,7 @@ BROWSE_TEMPLATE = """<!doctype html>
 """
 
 STATUS_TEMPLATE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta http-equiv="refresh" content="2">
+<html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Scanning...</title>
 <style>
@@ -398,11 +398,41 @@ STATUS_TEMPLATE = """<!doctype html>
 </style></head>
 <body><div class="box">
   {% if scan_root %}<div class="path">{{ scan_root }}</div>{% endif %}
-  <div class="stage">{{ state.stage or 'starting' }}&hellip;</div>
-  <div class="count">{{ state.done }}/{{ state.total }}</div>
-  <div class="timing">Elapsed: {{ elapsed }}{% if eta %} &middot; Est. remaining: {{ eta }}{% endif %}</div>
-  {% if state.error %}<div class="error">Error: {{ state.error }}</div>{% endif %}
-</div></body></html>
+  <div class="stage" id="stage">{{ state.stage or 'starting' }}&hellip;</div>
+  <div class="count" id="count">{{ state.done }}/{{ state.total }}</div>
+  <div class="timing" id="timing">Elapsed: {{ elapsed }}{% if eta %} &middot; Est. remaining: {{ eta }}{% endif %}</div>
+  <div class="error" id="error-box" style="display:{{ 'block' if state.error else 'none' }}">{% if state.error %}Error: {{ state.error }}{% endif %}</div>
+</div>
+<script>
+// Polls this same URL's JSON form via fetch instead of relying on
+// <meta http-equiv="refresh"> -- that got silently throttled/skipped in
+// backgrounded or inactive browser tabs, leaving this page frozen at its
+// very first render (stuck at "0/0, Elapsed: 0s") while the scan kept
+// progressing normally server-side, with no way to tell from the page.
+async function poll() {
+  try {
+    const url = new URL(location.href);
+    url.searchParams.set('json', '1');
+    const resp = await fetch(url);
+    const data = await resp.json();
+    if (data.redirect) { location.href = data.redirect; return; }
+    document.getElementById('stage').textContent = (data.stage || 'starting') + '…';
+    document.getElementById('count').textContent = data.done + '/' + data.total;
+    document.getElementById('timing').textContent =
+      'Elapsed: ' + data.elapsed + (data.eta ? ' · Est. remaining: ' + data.eta : '');
+    if (data.error) {
+      const errBox = document.getElementById('error-box');
+      errBox.textContent = 'Error: ' + data.error;
+      errBox.style.display = 'block';
+    }
+  } catch (e) {
+    // transient network hiccup -- just retry on the next tick
+  }
+  setTimeout(poll, 1500);
+}
+setTimeout(poll, 1500);
+</script>
+</body></html>
 """
 
 # Archive-move mode: a same-disk relocation from the live-synced --sync-root
@@ -512,9 +542,10 @@ ARCHIVE_CONFIRM_TEMPLATE = """<!doctype html>
   <p style="font-size:12px;color:#666;margin-top:10px">"Group into events" is for a flat, undated dump of
     photos (like a raw sync folder) -- it splits them into per-occasion albums with a thumbnail review
     before moving. If this folder is already one coherent event, just confirm the move directly above.
-    It ignores the date range above (which filters by file mtime) and always looks at the whole folder,
-    clustering by each photo's real capture time instead -- narrow to specific events using the review
-    page's own controls afterward.</p>
+    Unlike the count above it, it applies the date range by each photo's real EXIF capture time rather
+    than file mtime (every photo still gets listed and timestamped first, so this is accurate rather
+    than the unreliable mtime-based filter) -- leave both dates blank to consider the whole folder, or
+    narrow further using the review page's own controls afterward.</p>
   <a class="back" href="{{ url_for('archive_browse', path=path) }}">&larr; back to browse</a>
 </main>
 </body></html>
@@ -594,9 +625,14 @@ EVENT_REVIEW_TEMPLATE = """<!DOCTYPE html>
   .event-header input.event-name { font-size: 14px; font-weight: 600; padding: 6px 8px; border-radius: 6px;
                                      border: 1px solid #ccc; min-width: 240px; flex: 1 1 240px; }
   .event-meta { font-size: 12px; color: #666; }
-  .event-header .merge-btn { margin-left: auto; background: #444a55; color: #fff; border: none;
+  .event-header .event-actions { margin-left: auto; display: flex; gap: 8px; flex-wrap: wrap; }
+  .event-header .merge-btn { background: #444a55; color: #fff; border: none;
                               padding: 6px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; }
-  .event-header .merge-btn:hover { filter: brightness(1.1); }
+  .event-header .merge-btn:hover:not(:disabled) { filter: brightness(1.1); }
+  .event-header .confirm-event-btn { background: #16a34a; color: #fff; border: none;
+                                      padding: 6px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; }
+  .event-header .confirm-event-btn:hover:not(:disabled) { filter: brightness(1.1); }
+  .event-header button:disabled { opacity: 0.5; cursor: default; }
   .files { display: flex; gap: 12px; flex-wrap: wrap; }
   .file-card { width: 170px; border: 2px solid transparent; border-radius: 8px; padding: 6px; position: relative; }
   .file-card.excluded { opacity: 0.4; }
@@ -642,6 +678,11 @@ EVENT_REVIEW_TEMPLATE = """<!DOCTYPE html>
 const ALL_FILES = __FILES_JSON__;
 const ARCHIVE_ROOT = __ARCHIVE_ROOT_JSON__;
 let STATE = [];
+// Stable per-event id, independent of array position -- confirming a single
+// event is async, and another card can be merged/confirmed/reclustered away
+// while that request is in flight, which would shift positional indexes out
+// from under it.
+let nextEventUid = 1;
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -698,6 +739,7 @@ function clusterEvents(files, gapSeconds) {
   events.forEach(e => {
     e.files.sort((a, b) => a.tsMs - b.tsMs);
     e.name = suggestName(e.startTs, e.endTs);
+    e.uid = nextEventUid++;
   });
   return events;
 }
@@ -734,11 +776,14 @@ function fileCardHtml(f) {
 function eventCardHtml(e, i, total) {
   const files = e.files.map(fileCardHtml).join('');
   return `
-    <section class="event-card" data-event-index="${i}">
+    <section class="event-card" data-event-index="${i}" data-event-uid="${e.uid}">
       <div class="event-header">
         <input class="event-name" data-action="rename" value="${escapeHtml(e.name)}">
         <span class="event-meta">${e.files.length} file(s), ${suggestName(e.startTs, e.endTs)}</span>
-        ${i > 0 ? '<button class="merge-btn" data-action="merge-prev">Merge with previous event</button>' : ''}
+        <div class="event-actions">
+          ${i > 0 ? '<button class="merge-btn" data-action="merge-prev">Merge with previous event</button>' : ''}
+          <button class="confirm-event-btn" data-action="confirm-event">Confirm this event</button>
+        </div>
       </div>
       <div class="files">${files}</div>
     </section>`;
@@ -798,6 +843,8 @@ document.getElementById('main').addEventListener('click', (ev) => {
   } else if (action === 'move-prev' || action === 'move-next') {
     const path = ev.target.closest('.file-card').dataset.path;
     moveFile(idx, path, action === 'move-prev' ? -1 : 1);
+  } else if (action === 'confirm-event') {
+    confirmEvent(card.dataset.eventUid);
   }
 });
 
@@ -829,6 +876,52 @@ document.getElementById('main').addEventListener('change', (ev) => {
   const f = STATE[idx].files.find(x => x.path === path);
   if (f) f.excluded = ev.target.checked;
 });
+
+// Moves a single event, identified by its stable uid (not array position --
+// see the note by nextEventUid). Leaves every other event's card, edits,
+// and in-flight requests untouched.
+async function confirmEvent(uid) {
+  const e = STATE.find(x => String(x.uid) === String(uid));
+  if (!e) return;  // already moved by a request that resolved first
+
+  const paths = e.files.filter(f => !f.excluded).map(f => f.path);
+  if (!paths.length) { alert('Nothing to move in this event -- everything is marked "skip".'); return; }
+  if (!confirm(`Move event "${e.name}" (${paths.length} file(s)) into ${ARCHIVE_ROOT}?`)) return;
+
+  const card = document.querySelector(`.event-card[data-event-uid="${uid}"]`);
+  const btn = card.querySelector('[data-action="confirm-event"]');
+  card.querySelectorAll('button, input').forEach(el => el.disabled = true);
+  btn.textContent = 'Moving...';
+
+  try {
+    const resp = await fetch('/archive/events/confirm', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({events: [{name: e.name, paths}]}),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Move failed');
+
+    const moved = new Set(paths);
+    for (let i = ALL_FILES.length - 1; i >= 0; i--) {
+      if (moved.has(ALL_FILES[i].path)) ALL_FILES.splice(i, 1);
+    }
+    // Only the moved files leave the event; anything marked "skip" stays
+    // behind so it isn't silently lost (it'll resurface on the next
+    // recluster, same as any other not-yet-moved file).
+    e.files = e.files.filter(f => f.excluded);
+    const idx = STATE.indexOf(e);
+    if (e.files.length === 0) {
+      if (idx >= 0) STATE.splice(idx, 1);
+    } else {
+      recomputeEvent(e);
+    }
+    render();
+  } catch (err) {
+    alert('Move failed: ' + err.message);
+    card.querySelectorAll('button, input').forEach(el => el.disabled = false);
+    btn.textContent = 'Confirm this event';
+  }
+}
 
 document.getElementById('confirm-btn').addEventListener('click', async () => {
   const events = STATE
@@ -1826,25 +1919,40 @@ def _fmt_duration(seconds):
     return f"{h}h {m}m"
 
 
-@app.route("/scan/status")
-def scan_status():
-    if not SCAN_STATE["running"] and SCAN_STATE["stage"] == "done" and not SCAN_STATE["error"]:
-        return redirect(url_for("review"))
-
+def _scan_progress(state):
+    """(elapsed_str, eta_str_or_None) for a SCAN_STATE/EVENT_SCAN_STATE-
+    shaped dict -- shared by both status routes below (STATUS_TEMPLATE's
+    JS poll and the plain HTML render both need the same numbers)."""
     now = time.time()
-    stage_started_at = SCAN_STATE.get("stage_started_at") or now
+    stage_started_at = state.get("stage_started_at") or now
     stage_elapsed = now - stage_started_at
-    done, total = SCAN_STATE["done"], SCAN_STATE["total"]
-    baseline = SCAN_STATE.get("stage_baseline_done", 0)
+    done, total = state["done"], state["total"]
+    baseline = state.get("stage_baseline_done", 0)
     progressed = max(done - baseline, 0)
     eta = None
     if progressed > 0 and total > done:
         rate = stage_elapsed / progressed
         eta = _fmt_duration(rate * (total - done))
+    return _fmt_duration(stage_elapsed), eta
 
+
+@app.route("/scan/status")
+def scan_status():
+    done_url = url_for("review")
+    if not SCAN_STATE["running"] and SCAN_STATE["stage"] == "done" and not SCAN_STATE["error"]:
+        if request.args.get("json"):
+            return jsonify({"redirect": done_url})
+        return redirect(done_url)
+
+    elapsed, eta = _scan_progress(SCAN_STATE)
+    if request.args.get("json"):
+        return jsonify({
+            "stage": SCAN_STATE["stage"], "done": SCAN_STATE["done"], "total": SCAN_STATE["total"],
+            "error": SCAN_STATE["error"], "elapsed": elapsed, "eta": eta, "redirect": None,
+        })
     return render_template_string(
         STATUS_TEMPLATE, state=SCAN_STATE, scan_root=_load_scan_root(),
-        elapsed=_fmt_duration(stage_elapsed), eta=eta,
+        elapsed=elapsed, eta=eta,
     )
 
 
@@ -2012,18 +2120,22 @@ def do_archive():
 
 @app.route("/archive/events/scan", methods=["POST"])
 def archive_events_scan():
-    # Deliberately ignores the date_from/date_to fields the shared
-    # archive-confirm form also submits (they're for the plain whole-tree
-    # move's mtime-based filter, see do_archive) -- pre-narrowing this
-    # flow's folder walk by mtime was found to silently drop real matches
-    # (e.g. 37 photos on a real EXIF-verified day down to 7) on netbooks
-    # where mtime doesn't track capture date. This flow's whole purpose is
-    # discovering event boundaries by real EXIF time across the folder;
-    # narrowing to one date is what the review page's per-event
-    # exclude/skip controls are for, after clustering has already happened.
+    # Narrows by the same date_from/date_to fields the shared archive-confirm
+    # form submits, but NOT by pre-filtering the folder walk by mtime like
+    # the plain whole-tree move (do_archive) does -- that was found to
+    # silently drop real matches (e.g. 37 photos on a real EXIF-verified day
+    # down to 7) on netbooks where mtime doesn't track capture date. Instead
+    # scan_events() still lists and timestamps every image first, then keeps
+    # only the ones whose real EXIF timestamp falls in range -- see its
+    # docstring. The review page's per-event exclude/skip controls remain
+    # available for narrowing further after clustering.
     path = request.form.get("path")
     if not path:
         abort(400)
+    date_from_ts, date_to_ts, date_error = _parse_date_range(
+        request.form.get("date_from", ""), request.form.get("date_to", ""))
+    if date_error:
+        abort(400, date_error)
 
     with EVENT_SCAN_LOCK:
         if EVENT_SCAN_STATE["running"]:
@@ -2048,6 +2160,7 @@ def archive_events_scan():
                 key_filename=CONFIG["key_filename"], password=CONFIG["password"],
                 workers=CONFIG["workers"], max_seconds=None,
                 progress_cb=progress_cb,
+                date_from_ts=date_from_ts, date_to_ts=date_to_ts,
             )
             if result["status"] == "complete":
                 _save_event_scan_result({
@@ -2065,23 +2178,21 @@ def archive_events_scan():
 
 @app.route("/archive/events/scan/status")
 def archive_events_scan_status():
+    done_url = url_for("archive_events_review")
     if not EVENT_SCAN_STATE["running"] and EVENT_SCAN_STATE["stage"] == "done" and not EVENT_SCAN_STATE["error"]:
-        return redirect(url_for("archive_events_review"))
+        if request.args.get("json"):
+            return jsonify({"redirect": done_url})
+        return redirect(done_url)
 
-    now = time.time()
-    stage_started_at = EVENT_SCAN_STATE.get("stage_started_at") or now
-    stage_elapsed = now - stage_started_at
-    done, total = EVENT_SCAN_STATE["done"], EVENT_SCAN_STATE["total"]
-    baseline = EVENT_SCAN_STATE.get("stage_baseline_done", 0)
-    progressed = max(done - baseline, 0)
-    eta = None
-    if progressed > 0 and total > done:
-        rate = stage_elapsed / progressed
-        eta = _fmt_duration(rate * (total - done))
-
+    elapsed, eta = _scan_progress(EVENT_SCAN_STATE)
+    if request.args.get("json"):
+        return jsonify({
+            "stage": EVENT_SCAN_STATE["stage"], "done": EVENT_SCAN_STATE["done"], "total": EVENT_SCAN_STATE["total"],
+            "error": EVENT_SCAN_STATE["error"], "elapsed": elapsed, "eta": eta, "redirect": None,
+        })
     return render_template_string(
         STATUS_TEMPLATE, state=EVENT_SCAN_STATE, scan_root=EVENT_SCAN_STATE.get("root"),
-        elapsed=_fmt_duration(stage_elapsed), eta=eta,
+        elapsed=elapsed, eta=eta,
     )
 
 

@@ -351,6 +351,70 @@ def _thumb_worker(pool, remote_path):
         return None
 
 
+# Archive mode's "group into events" flow thumbnails EVERY photo in a
+# folder, not just duplicates -- at thousand-photo scale, _thumb_worker's
+# full-photo download per item (the same cost _hash_worker's HASH_PREFIX_BYTES
+# trick exists specifically to avoid) becomes the dominant cost of the whole
+# scan. Default event-thumb save cadence is coarser than SAVE_EVERY for the
+# same reason (see _run_cached_stage's save_every docstring).
+EVENT_THUMB_SAVE_EVERY = 200
+
+
+def _event_thumb_worker(pool, remote_path):
+    """Thumbnail worker for the event-review grid: reuses the small
+    EXIF-embedded preview _hash_worker already knows how to pull out of a
+    bounded prefix read (see _embedded_thumb_bytes), instead of downloading
+    the full photo like _thumb_worker does -- avoids a second multi-MB
+    transfer per photo on top of the prefix _ts_worker already reads for
+    the same file. Embedded previews are typically ~160x120, plenty for the
+    review grid's small cards, and only need their orientation corrected
+    (the embedded thumbnail carries no EXIF of its own -- apply the parent
+    photo's Orientation tag manually). Falls back to _thumb_worker's full
+    download-and-resize path when a photo has no embedded thumbnail (rare:
+    PNGs, screenshots, images that never went through a camera pipeline).
+    Same return shape as _thumb_worker (plain base64 string or None) so
+    both are interchangeable values in the same cache file -- thumbnails
+    already cached by the older, full-download method stay valid and are
+    never reprocessed."""
+    sftp = pool.get_sftp()
+    try:
+        prefix, is_whole_file = _read_prefix(sftp, remote_path, HASH_PREFIX_BYTES)
+        orientation = None
+        try:
+            with Image.open(io.BytesIO(prefix)) as hdr_img:
+                orientation = hdr_img.getexif().get(0x0112)  # 0x0112 = Orientation
+        except Exception:
+            pass
+
+        thumb_bytes = _embedded_thumb_bytes(prefix)
+        if thumb_bytes:
+            try:
+                with Image.open(io.BytesIO(thumb_bytes)) as timg:
+                    if orientation and orientation != 1:
+                        oexif = Image.Exif()
+                        oexif[0x0112] = orientation
+                        timg.info["exif"] = oexif.tobytes()
+                        timg = ImageOps.exif_transpose(timg)
+                    timg = timg.convert("RGB")
+                    buf = io.BytesIO()
+                    timg.save(buf, format="JPEG", quality=THUMB_QUALITY, optimize=True)
+                    return base64.b64encode(buf.getvalue()).decode("ascii")
+            except Exception:
+                pass  # fall through to the full-download path below
+
+        full_data = prefix if is_whole_file else remote_client.read_bytes(sftp, remote_path)
+        with Image.open(io.BytesIO(full_data)) as img:
+            img.draft("RGB", (THUMB_MAX_DIM * 2, THUMB_MAX_DIM * 2))
+            img = ImageOps.exif_transpose(img)
+            img.thumbnail((THUMB_MAX_DIM, THUMB_MAX_DIM), Image.LANCZOS)
+            img = img.convert("RGB")
+            buf = io.BytesIO()
+            img.save(buf, format="JPEG", quality=THUMB_QUALITY, optimize=True)
+            return base64.b64encode(buf.getvalue()).decode("ascii")
+    except Exception:
+        return None
+
+
 def _load_json(path: Path, default):
     if path.exists():
         try:
@@ -366,9 +430,14 @@ def _save_json(path: Path, data):
         json.dump(data, f)
 
 
-def _run_cached_stage(paths, cache_path, worker_fn, *, workers, max_seconds, progress_cb, stage_name):
+def _run_cached_stage(paths, cache_path, worker_fn, *, workers, max_seconds, progress_cb, stage_name,
+                       save_every=SAVE_EVERY):
     """Threaded resumable pass over `paths`: worker_fn(path) -> JSON-able
-    value, cached to cache_path. Returns (cache_dict, completed: bool)."""
+    value, cached to cache_path. Returns (cache_dict, completed: bool).
+    `save_every` overrides the default cache-flush cadence -- worth raising
+    for stages whose cached values are large (e.g. base64 thumbnails),
+    where re-serializing the whole dict every SAVE_EVERY=20 items becomes
+    real, avoidable disk I/O at thousand-photo scale."""
     cache = _load_json(cache_path, {})
     already = len(paths) - len([p for p in paths if p not in cache])
     if progress_cb:
@@ -391,7 +460,7 @@ def _run_cached_stage(paths, cache_path, worker_fn, *, workers, max_seconds, pro
                 print(f"  [{stage_name}] error on {p}: {e}", file=sys.stderr)
                 continue
             done_this_run += 1
-            if done_this_run % SAVE_EVERY == 0:
+            if done_this_run % save_every == 0:
                 _save_json(cache_path, cache)
                 if progress_cb:
                     progress_cb(stage_name, already + done_this_run, len(paths))
@@ -501,7 +570,8 @@ def run_scan(remote_folder, out_dir, *, host, port=22, username=None,
 
 def scan_events(remote_folder, out_dir, *, host, port=22, username=None,
                  key_filename=None, password=None,
-                 workers=4, max_seconds=None, progress_cb=None):
+                 workers=4, max_seconds=None, progress_cb=None,
+                 date_from_ts=None, date_to_ts=None):
     """Staged pipeline for archive mode's "group into events" flow: lists
     every file under remote_folder (photos and everything else alike), gets
     a timestamp for every photo (EXIF, falling back to mtime -- see
@@ -510,54 +580,102 @@ def scan_events(remote_folder, out_dir, *, host, port=22, username=None,
     the event review grid. Non-photo files need no network read at all:
     their mtime already came back for free from the directory listing.
 
+    Optional date_from_ts/date_to_ts (unix timestamps, date_to exclusive)
+    narrow the result -- but unlike move_tree()'s mtime-based filter, this
+    narrows AFTER the timestamps stage has computed each photo's real EXIF
+    capture time, not before: pre-filtering the walk by mtime was found (on
+    a real netbook) to diverge substantially from EXIF capture date and
+    silently drop real matches. Every image still gets listed and
+    timestamped (that discovery work can't be skipped without knowing its
+    real date first), but only images whose real timestamp falls in range
+    proceed to the thumbnailing stage, and only those are returned --
+    narrowing this way is what keeps a repeat scan of the same folder with
+    a different date range fast, since event_ts_cache.json already has
+    every photo's real timestamp cached from the first pass. Non-image
+    "other" files are narrowed by mtime (no EXIF to fall back on), same as
+    move_tree(). The review page's per-event controls remain available for
+    further narrowing after clustering.
+
     Writes/resumes event_ts_cache.json and event_thumb_cache.json under
     out_dir -- kept separate from run_scan()'s hash/score/thumb caches so
     the two features' cache files don't get entangled. Same
     resumable-by-rerunning contract as run_scan(): a dropped connection or
-    --max-seconds cutoff just means calling this again."""
+    --max-seconds cutoff just means calling this again.
+
+    On completion, the result also carries the exact file selection
+    (`images`: list of paths, `others`: list of {path, mtime}) so the
+    caller can persist it -- review/confirm need to know exactly which
+    files this particular scan covered, since the cache files themselves
+    accumulate entries across every folder ever event-scanned."""
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     ts_cache_path = out_dir / "event_ts_cache.json"
     thumb_cache_path = out_dir / "event_thumb_cache.json"
 
     pool = ConnectionPool(host, port, username, key_filename, password)
-    sftp = pool.get_sftp()
+    try:
+        sftp = pool.get_sftp()
 
-    if progress_cb:
-        progress_cb("listing", 0, 0)
-    all_files = list(remote_client.list_files(sftp, remote_folder))
-    file_info = {f["path"]: f for f in all_files}
-    image_paths = [
-        f["path"] for f in all_files
-        if PurePosixPath(f["path"]).suffix.lower() in remote_client.IMAGE_EXTS
-    ]
-    if progress_cb:
-        progress_cb("listing", len(all_files), len(all_files))
-    print(f"Found {len(all_files)} files ({len(image_paths)} images) under {remote_folder}.")
+        if progress_cb:
+            progress_cb("listing", 0, 0)
+        all_files = list(remote_client.list_files(sftp, remote_folder))
+        file_info = {f["path"]: f for f in all_files}
+        image_paths = [
+            f["path"] for f in all_files
+            if PurePosixPath(f["path"]).suffix.lower() in remote_client.IMAGE_EXTS
+        ]
+        image_path_set = set(image_paths)
+        other_files = [f for f in all_files if f["path"] not in image_path_set]
+        if progress_cb:
+            progress_cb("listing", len(all_files), len(all_files))
+        print(f"Found {len(all_files)} files ({len(image_paths)} images) under {remote_folder}.")
 
-    ts_cache, ts_done = _run_cached_stage(
-        image_paths, ts_cache_path, functools.partial(_ts_worker, pool, file_info),
-        workers=workers, max_seconds=max_seconds, progress_cb=progress_cb,
-        stage_name="timestamps",
-    )
-    if not ts_done:
-        return {"status": "incomplete", "stage": "timestamps"}
+        ts_cache, ts_done = _run_cached_stage(
+            image_paths, ts_cache_path, functools.partial(_ts_worker, pool, file_info),
+            workers=workers, max_seconds=max_seconds, progress_cb=progress_cb,
+            stage_name="timestamps",
+        )
+        if not ts_done:
+            return {"status": "incomplete", "stage": "timestamps"}
 
-    thumb_cache, thumb_done = _run_cached_stage(
-        image_paths, thumb_cache_path, functools.partial(_thumb_worker, pool),
-        workers=workers, max_seconds=max_seconds, progress_cb=progress_cb,
-        stage_name="thumbnailing",
-    )
-    if not thumb_done:
-        return {"status": "incomplete", "stage": "thumbnailing"}
+        if date_from_ts is not None or date_to_ts is not None:
+            def _ts_in_range(p):
+                t = datetime.fromisoformat(ts_cache[p]["ts"]).timestamp()
+                if date_from_ts is not None and t < date_from_ts:
+                    return False
+                if date_to_ts is not None and t >= date_to_ts:
+                    return False
+                return True
 
-    if progress_cb:
-        progress_cb("done", len(image_paths), len(image_paths))
-    return {
-        "status": "complete",
-        "total_files": len(all_files),
-        "image_files": len(image_paths),
-    }
+            def _mtime_in_range(f):
+                t = f["mtime"]
+                if date_from_ts is not None and t < date_from_ts:
+                    return False
+                if date_to_ts is not None and t >= date_to_ts:
+                    return False
+                return True
+
+            image_paths = [p for p in image_paths if p in ts_cache and _ts_in_range(p)]
+            other_files = [f for f in other_files if _mtime_in_range(f)]
+
+        thumb_cache, thumb_done = _run_cached_stage(
+            image_paths, thumb_cache_path, functools.partial(_event_thumb_worker, pool),
+            workers=workers, max_seconds=max_seconds, progress_cb=progress_cb,
+            stage_name="thumbnailing", save_every=EVENT_THUMB_SAVE_EVERY,
+        )
+        if not thumb_done:
+            return {"status": "incomplete", "stage": "thumbnailing"}
+
+        if progress_cb:
+            progress_cb("done", len(image_paths), len(image_paths))
+        return {
+            "status": "complete",
+            "total_files": len(all_files),
+            "images": image_paths,
+            "others": [{"path": f["path"], "mtime": f["mtime"]} for f in other_files],
+        }
+    finally:
+        pool.close()
 
 
 def main():
