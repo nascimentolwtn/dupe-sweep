@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -m py_compile scan_remote.py remote_client.py serve_review.py)",
+      "Bash(echo \"compile exit: $?\")",
+      "Bash(\".venv/Scripts/python.exe\" -m py_compile scan_remote.py remote_client.py serve_review.py)",
+      "Bash(node _test_cluster.js)",
+      "Bash(.venv/Scripts/python.exe -c ' *)"
+    ]
+  }
+}

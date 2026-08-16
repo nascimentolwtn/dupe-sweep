@@ -385,7 +385,7 @@ BROWSE_TEMPLATE = """<!doctype html>
 <header><h1>Browse netbook folders</h1>
   <a class="nav-link" href="{{ url_for('browse') }}">Dedup &rarr;</a>
   <a class="nav-link" href="{{ url_for('archive_browse') }}">Archive &rarr;</a>
-  <a class="nav-link" href="{{ url_for('purge_browse') }}">Purge/restore &rarr;</a>
+  <a class="nav-link" href="{{ url_for('purge_browse', path=path) }}">Purge/restore &rarr;</a>
 </header>
 <main>
   <div class="breadcrumb">{{ path }}</div>
@@ -497,7 +497,7 @@ ARCHIVE_BROWSE_TEMPLATE = """<!doctype html>
 <header><h1>Archive netbook folders</h1>
   <a class="nav-link" href="{{ url_for('browse') }}">Dedup &rarr;</a>
   <a class="nav-link" href="{{ url_for('archive_browse') }}">Archive &rarr;</a>
-  <a class="nav-link" href="{{ url_for('purge_browse') }}">Purge/restore &rarr;</a>
+  <a class="nav-link" href="{{ url_for('purge_browse', path=path) }}">Purge/restore &rarr;</a>
 </header>
 <main>
   <div class="breadcrumb">{{ path }}</div>
@@ -1036,7 +1036,7 @@ TRASH_BROWSE_TEMPLATE = """<!doctype html>
   <h1>{{ 'Purge' if mode == 'purge' else 'Restore' }} deleted photos</h1>
   <a class="nav-link" href="{{ url_for('browse') }}">Dedup &rarr;</a>
   <a class="nav-link" href="{{ url_for('archive_browse') }}">Archive &rarr;</a>
-  <a class="nav-link" href="{{ url_for('purge_browse') }}">Purge/restore &rarr;</a>
+  <a class="nav-link" href="{{ url_for('purge_browse', path=path) }}">Purge/restore &rarr;</a>
   <a class="nav-link" href="{{ url_for('restore_browse' if mode == 'purge' else 'purge_browse', path=path) }}">{{ 'Restore mode' if mode == 'purge' else 'Purge mode' }} &rarr;</a>
 </header>
 <main>
@@ -1317,7 +1317,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <button id="delete-btn" class="danger">Delete marked</button>
   <a href="/" style="color:#93c5fd;font-size:13px;text-decoration:none;margin-left:auto">Dedup &rarr;</a>
   <a href="/archive/browse" style="color:#93c5fd;font-size:13px;text-decoration:none">Archive &rarr;</a>
-  <a href="/purge/browse" style="color:#93c5fd;font-size:13px;text-decoration:none">Purge/restore &rarr;</a>
+  <a href="__PURGE_BROWSE_URL__" style="color:#93c5fd;font-size:13px;text-decoration:none">Purge/restore &rarr;</a>
 </header>
 <div class="lightbox" id="lightbox">
   <div class="lb-bar">
@@ -2013,6 +2013,8 @@ def review():
     html = HTML_TEMPLATE.replace("__GROUPS_JSON__", groups_json_str)
     html = html.replace("__SCAN_ROOT__", str(escape(scan_root)))
     html = html.replace("__RESCAN_ATTRS__", "" if scan_root else "disabled")
+    purge_url = url_for("purge_browse", path=scan_root) if scan_root else url_for("purge_browse")
+    html = html.replace("__PURGE_BROWSE_URL__", str(escape(purge_url)))
     return html
 
 
