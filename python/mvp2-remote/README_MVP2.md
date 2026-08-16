@@ -23,20 +23,39 @@ the Dart app).
 
 ## What's here
 
-- `remote_client.py` — paramiko SSH/SFTP helper: connect, a non-recursive
-  `list_subdirs()` (folder picker), recursive walks (`list_images()` for
-  photos only, `list_files()` for every file), `read_bytes()` (prefetched,
-  for fast full-file reads over SSH), `move_to_trash()` (move-not-delete,
-  with a `_1`/`_2` collision suffix instead of overwriting), `move_tree()`
-  (recursive same-disk relocation for archive mode, see below), and
-  `find_trash_dirs()`/`count_trash()`/`purge_trash()`/`restore_trash()` for
-  cleaning up `_to_delete` folders (see Purge/restore mode below).
+- `remote_client.py` — paramiko SSH/SFTP + native-exec helper: connect, a
+  non-recursive `list_subdirs()` (folder picker, SFTP — cheap and
+  interactive, exactly what SFTP is good at), recursive walks
+  (`list_images()` for photos only, `list_files()` for every file, still
+  SFTP since these are scoped to one scan/archive folder at a time),
+  `move_to_trash()` (move-not-delete, with a `_1`/`_2` collision suffix
+  instead of overwriting), `move_tree()` (recursive same-disk relocation
+  for archive mode, see below). `read_bytes()` and
+  `find_trash_dirs()`/`count_trash()`/`purge_trash()`/`restore_trash()` (see
+  Purge/restore mode below) run over **native SSH exec** (`cat`/`find`/
+  `rm`/`du`) instead of SFTP — see "Why native SSH exec, not SFTP" below.
 - `scan_remote.py` — the heavy lifting: hashes + EXIF-timestamps every image
   found (`hash_cache.json`), clusters by time proximity then visual
   similarity, then scores sharpness/exposure (`score_cache.json`) and
   thumbnails (`thumb_cache.json`) *only* for photos that ended up in a
   group. Threaded and resumable, same as `python-mvp1`. Usable as a CLI or
   imported (`run_scan(...)`) by `serve_review.py`.
+
+  **Hashing is fast because it avoids downloading full photos.** Almost
+  every camera/phone JPEG embeds a small EXIF preview thumbnail (a few KB)
+  near the start of the file; `_hash_worker` reads only a bounded prefix
+  (`HASH_PREFIX_BYTES`, 200KB) over SFTP, pulls that embedded thumbnail out
+  with `piexif`, and hashes it instead of the full multi-MB photo —
+  measured **~19x faster** against the real netbook (0.5s/photo vs.
+  10s/photo for a ~4MB photo). Falls back to downloading and hashing the
+  full photo only when no embedded thumbnail exists (rare — mainly PNGs or
+  images that never went through a camera pipeline). EXIF timestamp
+  extraction also runs on this same prefix now, so it's effectively free.
+  Scoring and thumbnailing still need real image data (sharpness detection
+  in particular would be meaningless on an already-soft preview thumbnail)
+  and are unaffected — but they only run on photos that end up in a
+  duplicate group, a small fraction of a typical library, so this was never
+  the bottleneck.
 - `serve_review.py` — local Flask app (runs on this PC, not the netbook):
   browse the netbook's folders, kick off a scan, review duplicate groups
   with embedded thumbnails, and delete straight from the page (delete goes
@@ -44,8 +63,63 @@ the Dart app).
   hosts archive mode (`/archive/browse`, `/archive/confirm`, `POST
   /archive` — see below) and purge/restore mode (`/purge/browse`,
   `/purge/confirm`, `POST /purge`, `/restore/browse`, `/restore/confirm`,
-  `POST /restore` — see below).
-- `requirements.txt` — `pillow`, `imagehash`, `numpy`, `paramiko`, `flask`.
+  `POST /restore` — see below). The review page header shows the folder
+  currently being worked on and has a **Re-scan** button that re-runs the
+  scan against that same folder (merging with what's already cached). Each
+  group also has a **Compare** button — an overlapping before/after slider
+  between two full-resolution photos (drag or tap to move the divider, zoom
+  and pan in lockstep on both sides, mark either side for deletion), ported
+  from the Flutter app's `PhotoSliderCompareScreen`. 2-photo groups get a
+  one-click Compare button (only one possible pair); 3+ photo groups
+  instead get a purple stage-checkbox on each photo (bottom-right, ported
+  from the Flutter app's `PhotoGroupCard`) — tap any two to compare them,
+  tap the staged one again to un-stage it. The scanning-progress page shows
+  elapsed time and an estimated time remaining for the current stage, based
+  on how fast this run's own progress is going (a resumed scan with a lot
+  already cached doesn't skew the estimate).
+
+All SFTP/SSH calls from the Flask app share one connection, serialized
+behind a lock (`_sftp_call`/`_ssh_call`/`_remote_call` in
+`serve_review.py`) — neither `paramiko.SFTPClient` nor issuing overlapping
+exec commands on one `SSHClient` is thread-safe, and Flask's dev server
+runs each request on its own thread, so two concurrent operations (e.g.
+Compare mode loading two full-res photos at once) could otherwise wedge the
+shared channel rather than just error. This only serializes remote I/O, not
+the whole request.
+
+## Why native SSH exec, not SFTP, for purge/restore/read
+
+`find_trash_dirs()`, `count_trash()`, `purge_trash()`, `restore_trash()`,
+and `read_bytes()` run `find`/`rm`/`du`/`cat` over a plain SSH exec channel
+instead of SFTP. This mattered in practice: purging `_to_delete` folders
+across a large root (the whole `/media/backup` browse root, not just one
+photo folder — which on a real backup drive can include a lot that isn't
+photos, e.g. `DVDTemp/HD_Games/Backups/...`) took **minutes** walking it
+directory-by-directory over SFTP (`listdir_attr()` is one SSH round trip
+*per directory*), versus **seconds** for the netbook's own `find` running
+natively against its own filesystem in one shot. `read_bytes()` (used by
+`/raw` for the lightbox/Compare full-resolution fetch) also moved to `cat`
+over exec — it skips SFTP's per-packet request/response framing for what's
+otherwise just a bulk sequential byte stream.
+
+SFTP is kept for:
+- **Browsing** (`list_subdirs()`) — cheap, one level at a time, and
+  genuinely benefits from SFTP's structured `listdir_attr()` (file
+  attributes without a second stat) for an interactive folder picker.
+- **Scan/archive discovery** (`list_images()`, `list_files()`) — these
+  walks are scoped to one folder the user explicitly chose to scan or
+  archive, not an entire drive, so they haven't shown the same blowup (and
+  changing them would mean re-deriving size/mtime via `find -printf`
+  instead of SFTP's structured attributes — a larger change than what was
+  actually slow).
+- **Per-file rename/collision handling** (`move_to_trash()`, `move_tree()`,
+  and `restore_trash()`'s actual moves) — fine-grained, stateful logic
+  (`_1`/`_2` suffix on a name collision) that doesn't fit a bulk shell
+  command; each individual `rename()` is cheap on its own, so this was
+  never the bottleneck. `restore_trash()` is a hybrid: native `find` for
+  discovering `_to_delete` folders and their contents, SFTP for the actual
+  per-file rename.
+- `requirements.txt` — `pillow`, `imagehash`, `numpy`, `paramiko`, `flask`, `piexif`.
 
 ## Prerequisites
 
@@ -178,11 +252,12 @@ a scan/delete happened, not just under `--sync-root`):
 2. **`/purge/confirm`** / **`/restore/confirm`** — recursively finds every
    `_to_delete` folder under the chosen path and previews how many folders/
    files/bytes are involved before anything happens.
-3. **`POST /purge`** — **permanently deletes** those files (`sftp.remove()`)
-   and removes the now-empty `_to_delete` folders. This is the one
-   genuinely destructive, irreversible operation anywhere in this tool —
-   everything else in both `python-mvp1` and `python-mvp2-remote` only ever
-   moves files.
+3. **`POST /purge`** — **permanently deletes** those files (native `rm -rf`
+   over SSH exec, see "Why native SSH exec, not SFTP" above) and removes
+   the now-empty `_to_delete` folders. This is the one genuinely
+   destructive, irreversible operation anywhere in this tool — everything
+   else in both `python-mvp1` and `python-mvp2-remote` only ever moves
+   files.
    **`POST /restore`** — moves those files back to the folder each was
    deleted from (undoing `move_to_trash()`), renaming on a name collision
    (`_1`/`_2` suffix, same as `move_to_trash()`) instead of overwriting,
@@ -190,6 +265,19 @@ a scan/delete happened, not just under `--sync-root`):
 
    Both return a summary: files affected, bytes affected, and (restore
    only) how many were renamed for a collision, plus any per-file errors.
+
+   Both also reconcile the review page's caches afterward (best-effort): any
+   already-deleted photo under the chosen path that's no longer sitting in a
+   `_to_delete` folder — because it was just purged (gone for good) or
+   restored (back in its original folder) — gets dropped from `hash_cache`/
+   `score_cache`/`thumb_cache`/`deleted_paths.json`. Since the review page
+   reclusters from `hash_cache` fresh on every load, this means the stale
+   thumbnail disappears immediately, and if that leaves a duplicate group
+   with fewer than 2 photos, the whole group disappears too (a "duplicate"
+   of one photo isn't a duplicate). The review page's **Re-scan** button
+   triggers this same reconciliation for whatever it just rescanned, so
+   photos purged before this reconciliation existed (or where the SSH call
+   otherwise failed) get cleaned up retroactively on the next rescan.
 
 ## Concurrency
 

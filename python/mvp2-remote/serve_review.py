@@ -49,12 +49,14 @@ import json
 import os
 import posixpath
 import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import imagehash
 import paramiko
 from flask import Flask, Response, abort, jsonify, redirect, render_template_string, request, url_for
+from markupsafe import escape
 
 import remote_client
 import scan_remote
@@ -74,36 +76,85 @@ app = Flask(__name__)
 CONFIG = {}
 
 SCAN_LOCK = threading.Lock()
-SCAN_STATE = {"running": False, "stage": None, "done": 0, "total": 0, "error": None}
+SCAN_STATE = {
+    "running": False, "stage": None, "done": 0, "total": 0, "error": None,
+    "stage_started_at": None, "stage_baseline_done": 0,
+}
 
 _client_lock = threading.Lock()
 _ssh_client = None
 _sftp_client = None
 
 
-def _get_sftp():
+def _connect_sftp():
     global _ssh_client, _sftp_client
-    with _client_lock:
-        if _sftp_client is None:
-            _ssh_client = remote_client.connect(
-                CONFIG["host"], CONFIG["port"], CONFIG["username"],
-                CONFIG["key_filename"], CONFIG["password"],
-            )
-            _sftp_client = _ssh_client.open_sftp()
-        return _sftp_client
+    _ssh_client = remote_client.connect(
+        CONFIG["host"], CONFIG["port"], CONFIG["username"],
+        CONFIG["key_filename"], CONFIG["password"],
+    )
+    _sftp_client = _ssh_client.open_sftp()
 
 
 def _sftp_call(fn):
-    """Call fn(sftp) against the shared connection; on a transport error
-    (netbook napped, connection dropped), reconnect once and retry."""
+    """Call fn(sftp) against the shared connection, serialized behind
+    _client_lock for the WHOLE call (not just the connect step) --
+    paramiko's SFTPClient isn't thread-safe, and Flask's dev server runs
+    request handlers on separate threads, so two concurrent callers (e.g.
+    the compare view loading two full-res photos at once) sharing one
+    SFTPClient can wedge the underlying channel rather than just raising.
+    On a transport error (netbook napped, connection dropped), reconnect
+    once and retry, still under the lock."""
     global _ssh_client, _sftp_client
-    try:
-        return fn(_get_sftp())
-    except (IOError, EOFError, paramiko.SSHException):
-        with _client_lock:
+    with _client_lock:
+        if _sftp_client is None:
+            _connect_sftp()
+        try:
+            return fn(_sftp_client)
+        except (IOError, EOFError, paramiko.SSHException):
             _sftp_client = None
             _ssh_client = None
-        return fn(_get_sftp())
+            _connect_sftp()
+            return fn(_sftp_client)
+
+
+def _ssh_call(fn):
+    """Like _sftp_call but hands fn the underlying SSHClient instead of an
+    SFTP session, for native find/rm/du/cat exec commands (see
+    remote_client.find_trash_dirs/count_trash/purge_trash/read_bytes) --
+    dramatically faster than SFTP's per-item round trips for whole-tree
+    operations like purge/restore, which used to take minutes walking a
+    large root directory by directory. Shares the same connection/lock/
+    reconnect logic as _sftp_call (both ride the same underlying
+    connection)."""
+    global _ssh_client, _sftp_client
+    with _client_lock:
+        if _ssh_client is None:
+            _connect_sftp()
+        try:
+            return fn(_ssh_client)
+        except (IOError, EOFError, paramiko.SSHException):
+            _sftp_client = None
+            _ssh_client = None
+            _connect_sftp()
+            return fn(_ssh_client)
+
+
+def _remote_call(fn):
+    """Like _sftp_call/_ssh_call but hands fn BOTH the SFTP session and the
+    underlying SSHClient in one locked block -- for restore_trash, which
+    needs native find for fast whole-tree discovery AND SFTP for the
+    per-file rename/collision handling."""
+    global _ssh_client, _sftp_client
+    with _client_lock:
+        if _sftp_client is None:
+            _connect_sftp()
+        try:
+            return fn(_sftp_client, _ssh_client)
+        except (IOError, EOFError, paramiko.SSHException):
+            _sftp_client = None
+            _ssh_client = None
+            _connect_sftp()
+            return fn(_sftp_client, _ssh_client)
 
 
 def _deleted_paths_file():
@@ -126,6 +177,79 @@ def _save_deleted_paths(paths_set):
         json.dump(sorted(paths_set), f)
 
 
+def _prune_caches(paths):
+    """Remove `paths` (original, pre-delete remote paths) from every cache
+    file in out_dir. _build_groups() reclusters from hash_cache.json fresh
+    on every render, so dropping an entry here also drops its thumbnail
+    (no more stale "already deleted" card) and, if that leaves its group
+    with fewer than 2 photos, the whole group -- cluster_by_time() and
+    split_by_similarity() already filter out single-photo groups."""
+    out_dir = Path(CONFIG["out_dir"])
+    paths = set(paths)
+    for fname in ("hash_cache.json", "score_cache.json", "thumb_cache.json"):
+        f = out_dir / fname
+        if not f.exists():
+            continue
+        with open(f, encoding="utf-8") as fh:
+            cache = json.load(fh)
+        if any(p in cache for p in paths):
+            for p in paths:
+                cache.pop(p, None)
+            with open(f, "w", encoding="utf-8") as fh:
+                json.dump(cache, fh)
+    deleted = _load_deleted_paths()
+    if deleted & paths:
+        _save_deleted_paths(deleted - paths)
+
+
+def _reconcile_deleted_cache(root):
+    """After a purge or restore under `root`, some entries in
+    deleted_paths.json (and their hash/score/thumb cache rows) no longer
+    reflect reality -- the file is either gone for good (purged) or back in
+    its original folder (restored), either way no longer sitting in a
+    _to_delete folder. Best-effort: only checks paths already marked
+    deleted under `root`, one stat() each."""
+    deleted = _load_deleted_paths()
+    candidates = [p for p in deleted if p.startswith(root)]
+    if not candidates:
+        return
+
+    def _find_stale(sftp):
+        stale = []
+        for orig in candidates:
+            parent, name = orig.rsplit("/", 1)
+            trashed_guess = f"{parent}/{remote_client.TRASH_DIRNAME}/{name}"
+            try:
+                sftp.stat(trashed_guess)
+            except IOError:
+                stale.append(orig)
+        return stale
+
+    stale = _sftp_call(_find_stale)
+    if stale:
+        _prune_caches(stale)
+
+
+def _scan_root_file():
+    return Path(CONFIG["out_dir"]) / "scan_root.json"
+
+
+def _load_scan_root():
+    p = _scan_root_file()
+    if p.exists():
+        try:
+            with open(p, encoding="utf-8") as f:
+                return json.load(f).get("path")
+        except Exception:
+            return None
+    return None
+
+
+def _save_scan_root(path):
+    with open(_scan_root_file(), "w", encoding="utf-8") as f:
+        json.dump({"path": path}, f)
+
+
 BROWSE_TEMPLATE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Browse netbook folders</title>
 <style>
@@ -141,7 +265,7 @@ BROWSE_TEMPLATE = """<!doctype html>
   li { margin-bottom: 6px; }
   a { color: #3b82f6; text-decoration: none; }
   a:hover { text-decoration: underline; }
-  .scan-btn { margin-top: 20px; }
+  .scan-btn { margin-bottom: 20px; }
   .scan-btn button { background: #3b82f6; color: #fff; border: none; padding: 10px 16px;
                       border-radius: 6px; font-size: 14px; cursor: pointer; }
   .scan-btn button:hover { filter: brightness(1.1); }
@@ -154,6 +278,10 @@ BROWSE_TEMPLATE = """<!doctype html>
 </header>
 <main>
   <div class="breadcrumb">{{ path }}</div>
+  <form class="scan-btn" method="post" action="{{ url_for('scan') }}">
+    <input type="hidden" name="path" value="{{ path }}">
+    <button type="submit">Scan this folder (and all subfolders)</button>
+  </form>
   {% if error %}<div class="error">Could not list this folder: {{ error }}</div>{% endif %}
   <ul>
     {% if path != '/' %}<li><a href="{{ url_for('browse', path=parent) }}">.. (up)</a></li>{% endif %}
@@ -161,10 +289,6 @@ BROWSE_TEMPLATE = """<!doctype html>
       <li><a href="{{ url_for('browse', path=(path.rstrip('/') + '/' + d)) }}">{{ d }}/</a></li>
     {% endfor %}
   </ul>
-  <form class="scan-btn" method="post" action="{{ url_for('scan') }}">
-    <input type="hidden" name="path" value="{{ path }}">
-    <button type="submit">Scan this folder (and all subfolders)</button>
-  </form>
 </main>
 </body></html>
 """
@@ -176,13 +300,18 @@ STATUS_TEMPLATE = """<!doctype html>
   body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background: #1d1f24; color: #fff;
          display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
   .box { text-align: center; }
+  .path { font-size: 13px; color: #aaa; margin-bottom: 14px; max-width: 80vw; word-break: break-all;
+          font-family: ui-monospace, Consolas, monospace; }
   .stage { font-size: 20px; margin-bottom: 10px; text-transform: capitalize; }
   .count { font-size: 14px; color: #aaa; }
+  .timing { font-size: 13px; color: #888; margin-top: 6px; }
   .error { color: #f87171; margin-top: 16px; max-width: 80vw; word-break: break-all; }
 </style></head>
 <body><div class="box">
+  {% if scan_root %}<div class="path">{{ scan_root }}</div>{% endif %}
   <div class="stage">{{ state.stage or 'starting' }}&hellip;</div>
   <div class="count">{{ state.done }}/{{ state.total }}</div>
+  <div class="timing">Elapsed: {{ elapsed }}{% if eta %} &middot; Est. remaining: {{ eta }}{% endif %}</div>
   {% if state.error %}<div class="error">Error: {{ state.error }}</div>{% endif %}
 </div></body></html>
 """
@@ -207,7 +336,7 @@ ARCHIVE_BROWSE_TEMPLATE = """<!doctype html>
   li { margin-bottom: 6px; }
   a { color: #3b82f6; text-decoration: none; }
   a:hover { text-decoration: underline; }
-  .scan-btn { margin-top: 20px; }
+  .scan-btn { margin-bottom: 20px; }
   .scan-btn button { background: #3b82f6; color: #fff; border: none; padding: 10px 16px;
                       border-radius: 6px; font-size: 14px; cursor: pointer; }
   .scan-btn button:hover { filter: brightness(1.1); }
@@ -223,6 +352,10 @@ ARCHIVE_BROWSE_TEMPLATE = """<!doctype html>
   <p style="font-size:13px;color:#666">Moving a folder here relocates it (same-disk, instant) from
     <code>{{ sync_root }}</code> into <code>{{ archive_root }}</code>, out of the way of the live sync
     client, so it's safe to delete the phone-side originals afterwards.</p>
+  <form class="scan-btn" method="get" action="{{ url_for('archive_confirm') }}">
+    <input type="hidden" name="path" value="{{ path }}">
+    <button type="submit">Archive this folder (and all subfolders)</button>
+  </form>
   {% if error %}<div class="error">Could not list this folder: {{ error }}</div>{% endif %}
   <ul>
     {% if can_go_up %}<li><a href="{{ url_for('archive_browse', path=parent) }}">.. (up)</a></li>{% endif %}
@@ -230,10 +363,6 @@ ARCHIVE_BROWSE_TEMPLATE = """<!doctype html>
       <li><a href="{{ url_for('archive_browse', path=(path.rstrip('/') + '/' + d)) }}">{{ d }}/</a></li>
     {% endfor %}
   </ul>
-  <form class="scan-btn" method="get" action="{{ url_for('archive_confirm') }}">
-    <input type="hidden" name="path" value="{{ path }}">
-    <button type="submit">Archive this folder (and all subfolders)</button>
-  </form>
 </main>
 </body></html>
 """
@@ -337,7 +466,7 @@ TRASH_BROWSE_TEMPLATE = """<!doctype html>
   li { margin-bottom: 6px; }
   a { color: #3b82f6; text-decoration: none; }
   a:hover { text-decoration: underline; }
-  .scan-btn { margin-top: 20px; }
+  .scan-btn { margin-bottom: 20px; }
   .scan-btn button { color: #fff; border: none; padding: 10px 16px; border-radius: 6px; font-size: 14px; cursor: pointer;
                       background: {{ '#dc2626' if mode == 'purge' else '#3b82f6' }}; }
   .scan-btn button:hover { filter: brightness(1.1); }
@@ -360,6 +489,10 @@ TRASH_BROWSE_TEMPLATE = """<!doctype html>
     was deleted from.
     {% endif %}
   </p>
+  <form class="scan-btn" method="get" action="{{ url_for(mode + '_confirm') }}">
+    <input type="hidden" name="path" value="{{ path }}">
+    <button type="submit">Find _to_delete folders here</button>
+  </form>
   {% if error %}<div class="error">Could not list this folder: {{ error }}</div>{% endif %}
   <ul>
     {% if path != '/' %}<li><a href="{{ url_for(mode + '_browse', path=parent) }}">.. (up)</a></li>{% endif %}
@@ -367,10 +500,6 @@ TRASH_BROWSE_TEMPLATE = """<!doctype html>
       <li><a href="{{ url_for(mode + '_browse', path=(path.rstrip('/') + '/' + d)) }}">{{ d }}/</a></li>
     {% endfor %}
   </ul>
-  <form class="scan-btn" method="get" action="{{ url_for(mode + '_confirm') }}">
-    <input type="hidden" name="path" value="{{ path }}">
-    <button type="submit">Find _to_delete folders here</button>
-  </form>
 </main>
 </body></html>
 """
@@ -482,6 +611,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
            display: flex; flex-wrap: wrap; gap: 16px; align-items: center; }
   header h1 { font-size: 16px; margin: 0; font-weight: 600; }
   header .stat { font-size: 13px; opacity: 0.85; }
+  header .path { font-size: 12px; opacity: 0.7; font-family: ui-monospace, Consolas, monospace; word-break: break-all; }
   header button { background: #3b82f6; color: #fff; border: none; padding: 8px 14px; border-radius: 6px;
                   font-size: 13px; cursor: pointer; }
   header button.secondary { background: #444a55; }
@@ -500,10 +630,16 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .photo-card.best { border-color: #22c55e; }
   .photo-card.marked-delete { opacity: 0.55; }
   .photo-card.already-deleted { opacity: 0.4; }
+  .photo-thumb-wrap { position: relative; }
   .photo-card img { width: 100%; height: 190px; object-fit: cover; border-radius: 6px; display: block; background: #eee; cursor: zoom-in; }
   .badge { position: absolute; top: 10px; left: 10px; background: #22c55e; color: #fff; font-size: 11px;
            padding: 2px 7px; border-radius: 999px; font-weight: 600; }
   .badge.deleted { background: #ef4444; left: auto; right: 10px; }
+  .cmp-stage-btn { position: absolute; bottom: 8px; right: 8px; width: 26px; height: 26px; border: none;
+                    border-radius: 5px; background: rgba(0,0,0,0.5); color: #fff; font-size: 15px; line-height: 1;
+                    cursor: pointer; display: flex; align-items: center; justify-content: center; padding: 0; }
+  .cmp-stage-btn:hover { background: rgba(0,0,0,0.7); }
+  .cmp-stage-btn.staged { color: #a78bfa; box-shadow: 0 0 0 2px #8b5cf6 inset; }
   .photo-meta { font-size: 11px; color: #555; margin-top: 6px; line-height: 1.4; word-break: break-all; }
   .photo-check { display: flex; align-items: center; gap: 6px; margin-top: 6px; font-size: 12px; }
   .empty { text-align: center; padding: 40px; color: #888; }
@@ -524,11 +660,54 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .lightbox .lb-nav:hover { background: #ffffff3a; }
   .lightbox .lb-prev { left: 20px; } .lightbox .lb-next { right: 20px; }
   .lightbox .lb-mark { display: flex; align-items: center; gap: 6px; color: #fff; font-size: 13px; margin-top: 8px; }
+
+  .cmp-open-btn { background: #8b5cf6; color: #fff; border: none; padding: 4px 10px; border-radius: 6px;
+                  font-size: 12px; cursor: pointer; }
+  .cmp-open-btn:hover { filter: brightness(1.1); }
+  .compare-overlay { position: fixed; inset: 0; background: #000; z-index: 200; display: none; flex-direction: column; }
+  .compare-overlay.open { display: flex; }
+  .compare-topbar { display: flex; align-items: center; gap: 12px; padding: 10px 16px; background: #1d1f24; color: #fff; }
+  .compare-topbar .cmp-title { font-size: 14px; font-weight: 600; }
+  .compare-topbar .cmp-zoom { margin-left: auto; display: flex; gap: 8px; }
+  .compare-topbar button { background: #ffffff22; color: #fff; border: 1px solid #fff5; padding: 6px 12px;
+                            border-radius: 6px; cursor: pointer; font-size: 13px; }
+  .compare-topbar button:hover:not(:disabled) { background: #ffffff3a; }
+  .compare-topbar button:disabled { opacity: 0.4; cursor: default; }
+  .cmp-stage { position: relative; flex: 1; overflow: hidden; touch-action: none; cursor: ew-resize; background: #000;
+               user-select: none; -webkit-user-select: none; }
+  .cmp-layer { position: absolute; top: 0; left: 0; transform-origin: center center; }
+  .cmp-layer img { width: 100%; height: 100%; object-fit: contain; display: block; pointer-events: none;
+                    -webkit-user-drag: none; user-drag: none; }
+  .cmp-clip-left { position: absolute; top: 0; left: 0; bottom: 0; overflow: hidden; }
+  .cmp-badge-wrap-right { position: absolute; top: 0; bottom: 0; right: 0; overflow: hidden; pointer-events: none; }
+  .cmp-badge { position: absolute; top: 8px; background: #22c55e; color: #fff; font-size: 11px; font-weight: 700;
+               padding: 3px 8px; border-radius: 999px; display: none; }
+  .cmp-badge.left-pos { left: 8px; }
+  .cmp-badge.right-pos { right: 8px; }
+  .cmp-divider-line { position: absolute; top: 0; bottom: 0; width: 2px; background: #fff9; pointer-events: none; }
+  .cmp-handle { position: absolute; top: 50%; width: 36px; height: 36px; margin-top: -18px; border-radius: 50%;
+                background: #fff; color: #111; display: flex; align-items: center; justify-content: center;
+                font-size: 16px; pointer-events: none; }
+  .cmp-pan { position: absolute; background: #00000066; color: #fff; border: none; width: 36px; height: 36px;
+             border-radius: 50%; cursor: pointer; font-size: 14px; display: none; }
+  .cmp-pan.show { display: block; }
+  .cmp-pan:hover { background: #000000aa; }
+  .cmp-pan-up { top: 8px; left: 50%; transform: translateX(-50%); }
+  .cmp-pan-down { bottom: 8px; left: 50%; transform: translateX(-50%); }
+  .cmp-pan-left { left: 8px; top: 50%; transform: translateY(-50%); }
+  .cmp-pan-right { right: 8px; top: 50%; transform: translateY(-50%); }
+  .compare-bottombar { display: flex; gap: 16px; padding: 12px 16px; background: #1d1f24; color: #fff;
+                        align-items: center; flex-wrap: wrap; }
+  .cmp-side { display: flex; align-items: center; gap: 8px; flex: 1; min-width: 220px; }
+  .cmp-side select { background: #2a2d35; color: #fff; border: 1px solid #444; border-radius: 6px;
+                      padding: 6px 8px; font-size: 12px; flex: 1; }
+  .cmp-side label { font-size: 12px; display: flex; align-items: center; gap: 6px; white-space: nowrap; }
 </style>
 </head>
 <body>
 <header>
   <h1>Duplicate photo review (remote)</h1>
+  <span class="path">__SCAN_ROOT__</span>
   <span class="stat" id="stat-summary">-</span>
   <button id="reset-btn">Reset to AI picks</button>
   <button id="clear-btn" class="secondary">Unmark all (keep everything)</button>
@@ -536,6 +715,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <button id="save-progress-btn" class="secondary">Save progress</button>
   <button id="load-progress-btn" class="secondary">Load progress</button>
   <input type="file" id="load-progress-input" accept="application/json" style="display:none">
+  <form method="post" action="/scan" style="display:inline;margin:0">
+    <input type="hidden" name="path" value="__SCAN_ROOT__">
+    <button type="submit" class="secondary" __RESCAN_ATTRS__ title="Re-scan __SCAN_ROOT__ for new or changed photos">Re-scan</button>
+  </form>
   <button id="delete-btn" class="danger">Delete marked</button>
   <a href="/archive/browse" style="color:#93c5fd;font-size:13px;text-decoration:none;margin-left:auto">Archive mode &rarr;</a>
   <a href="/purge/browse" style="color:#93c5fd;font-size:13px;text-decoration:none">Purge/restore &rarr;</a>
@@ -550,6 +733,40 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <div class="lb-meta" id="lb-meta"></div>
   <div class="lb-fallback" id="lb-fallback"></div>
   <label class="lb-mark"><input type="checkbox" id="lb-mark-cb"> Mark for deletion</label>
+</div>
+<div class="compare-overlay" id="compare-overlay">
+  <div class="compare-topbar">
+    <span class="cmp-title">Compare photos</span>
+    <div class="cmp-zoom">
+      <button id="cmp-zoom-out" title="Zoom out">&minus;</button>
+      <button id="cmp-zoom-in" title="Zoom in">+</button>
+    </div>
+    <button id="cmp-close">Close &#10005;</button>
+  </div>
+  <div class="cmp-stage" id="cmp-stage">
+    <div class="cmp-layer" id="cmp-layer-right"><img id="cmp-img-right" alt="" draggable="false"></div>
+    <div class="cmp-badge-wrap-right" id="cmp-badge-wrap-right"><span class="cmp-badge right-pos" id="cmp-badge-right">BEST</span></div>
+    <div class="cmp-clip-left" id="cmp-clip-left">
+      <div class="cmp-layer" id="cmp-layer-left"><img id="cmp-img-left" alt="" draggable="false"></div>
+      <span class="cmp-badge left-pos" id="cmp-badge-left">BEST</span>
+    </div>
+    <div class="cmp-divider-line" id="cmp-divider-line"></div>
+    <div class="cmp-handle" id="cmp-handle">&#8596;</div>
+    <button class="cmp-pan cmp-pan-up" id="cmp-pan-up" title="Pan up">&#9650;</button>
+    <button class="cmp-pan cmp-pan-down" id="cmp-pan-down" title="Pan down">&#9660;</button>
+    <button class="cmp-pan cmp-pan-left" id="cmp-pan-left" title="Pan left">&#9664;</button>
+    <button class="cmp-pan cmp-pan-right" id="cmp-pan-right" title="Pan right">&#9654;</button>
+  </div>
+  <div class="compare-bottombar">
+    <div class="cmp-side">
+      <select id="cmp-select-left"></select>
+      <label><input type="checkbox" id="cmp-mark-left"> Mark for deletion</label>
+    </div>
+    <div class="cmp-side">
+      <select id="cmp-select-right"></select>
+      <label><input type="checkbox" id="cmp-mark-right"> Mark for deletion</label>
+    </div>
+  </div>
 </div>
 <main id="main"></main>
 
@@ -617,6 +834,167 @@ document.addEventListener("keydown", (e) => {
   if (e.key === "ArrowRight") document.getElementById("lb-next").click();
 });
 
+// --- compare mode: overlapping 2-photo slider, ported from the Flutter
+// app's PhotoSliderCompareScreen. [right] renders full-bleed as the base
+// layer; [left] is clipped to a width (growing from the stage's left edge
+// as the divider moves right) -- dragging the divider right reveals more of
+// [left], dragging left reveals more of [right]. Zoom/pan apply identically
+// to both layers (same transform string on both .cmp-layer divs) so the two
+// photos stay pixel-aligned as you zoom in to compare detail.
+const CMP_MIN_ZOOM = 1.0, CMP_MAX_ZOOM = 4.0, CMP_ZOOM_STEP = 0.5, CMP_PAN_STEP = 40;
+let cmpGroup = -1, cmpLeftIdx = -1, cmpRightIdx = -1;
+let cmpPos = 0.5, cmpZoom = CMP_MIN_ZOOM, cmpPanX = 0, cmpPanY = 0, cmpDragging = false;
+
+// Bottom-right checkbox on each photo card, ported from the Flutter app's
+// PhotoGroupCard._handleCompareCheckboxTap: tapping the first photo in a
+// group stages it (turns purple); tapping a second, different photo in the
+// SAME group immediately opens Compare for the two and clears staging.
+// Tapping the already-staged photo again just un-stages it. Left/right is
+// assigned by each photo's position within the group (matching the
+// thumbnail row's order), not by which one was tapped first.
+function handleCompareStageTap(gi, ii) {
+  const g = GROUPS[gi];
+  const staged = g.stagedForCompare;
+  if (staged === undefined || staged === null) {
+    g.stagedForCompare = ii;
+    render();
+    return;
+  }
+  if (staged === ii) {
+    g.stagedForCompare = null;
+    render();
+    return;
+  }
+  g.stagedForCompare = null;
+  const left = Math.min(staged, ii), right = Math.max(staged, ii);
+  render();
+  openCompare(gi, left, right);
+}
+
+function openCompare(gi, leftIdx, rightIdx) {
+  cmpGroup = gi; cmpLeftIdx = leftIdx; cmpRightIdx = rightIdx;
+  cmpPos = 0.5; cmpZoom = CMP_MIN_ZOOM; cmpPanX = 0; cmpPanY = 0;
+  populateCompareSelects();
+  document.getElementById("compare-overlay").classList.add("open");
+  // Layer sizing needs real layout dimensions, which only exist once the
+  // overlay has actually been painted (it's `display:none` until the class
+  // above is applied) -- hence the rAF instead of sizing synchronously here.
+  requestAnimationFrame(() => {
+    sizeCompareLayers();
+    renderCompare();
+  });
+}
+function closeCompare() {
+  document.getElementById("compare-overlay").classList.remove("open");
+  cmpGroup = -1;
+}
+function populateCompareSelects() {
+  const g = GROUPS[cmpGroup];
+  const optsHtml = g.items.map((it, idx) =>
+    `<option value="${idx}">${idx === 0 ? "★ " : ""}${it.name}</option>`).join("");
+  const selL = document.getElementById("cmp-select-left");
+  const selR = document.getElementById("cmp-select-right");
+  selL.innerHTML = optsHtml; selR.innerHTML = optsHtml;
+  selL.value = cmpLeftIdx; selR.value = cmpRightIdx;
+  // Written back onto the group so the bottom-right picker on the main grid
+  // (and a later re-open of Compare) remembers the pair chosen in here.
+  selL.onchange = () => { cmpLeftIdx = +selL.value; renderCompare(); };
+  selR.onchange = () => { cmpRightIdx = +selR.value; renderCompare(); };
+}
+function sizeCompareLayers() {
+  const stage = document.getElementById("cmp-stage");
+  const w = stage.clientWidth + "px", h = stage.clientHeight + "px";
+  for (const id of ["cmp-layer-left", "cmp-layer-right"]) {
+    const el = document.getElementById(id);
+    el.style.width = w; el.style.height = h;
+  }
+}
+function renderCompare() {
+  if (cmpGroup < 0) return;
+  const g = GROUPS[cmpGroup];
+  const left = g.items[cmpLeftIdx], right = g.items[cmpRightIdx];
+  document.getElementById("cmp-img-left").src = "/raw?path=" + encodeURIComponent(left.path);
+  document.getElementById("cmp-img-right").src = "/raw?path=" + encodeURIComponent(right.path);
+  document.getElementById("cmp-badge-left").style.display = cmpLeftIdx === 0 ? "block" : "none";
+  document.getElementById("cmp-badge-right").style.display = cmpRightIdx === 0 ? "block" : "none";
+  const mL = document.getElementById("cmp-mark-left");
+  mL.checked = !!left.marked; mL.disabled = !!left.already_deleted;
+  mL.onchange = () => { left.marked = mL.checked; saveToLocalStorage(); render(); };
+  const mR = document.getElementById("cmp-mark-right");
+  mR.checked = !!right.marked; mR.disabled = !!right.already_deleted;
+  mR.onchange = () => { right.marked = mR.checked; saveToLocalStorage(); render(); };
+  updateCompareDivider();
+  updateCompareTransform();
+}
+function updateCompareDivider() {
+  const stage = document.getElementById("cmp-stage");
+  const w = stage.clientWidth;
+  const x = w * cmpPos;
+  document.getElementById("cmp-clip-left").style.width = x + "px";
+  document.getElementById("cmp-badge-wrap-right").style.left = x + "px";
+  document.getElementById("cmp-divider-line").style.left = (x - 1) + "px";
+  document.getElementById("cmp-handle").style.left = Math.min(Math.max(x - 18, 0), Math.max(w - 36, 0)) + "px";
+}
+function clampComparePan() {
+  const stage = document.getElementById("cmp-stage");
+  const maxX = (cmpZoom - 1) * stage.clientWidth / 2;
+  const maxY = (cmpZoom - 1) * stage.clientHeight / 2;
+  cmpPanX = Math.min(Math.max(cmpPanX, -maxX), maxX);
+  cmpPanY = Math.min(Math.max(cmpPanY, -maxY), maxY);
+}
+function updateCompareTransform() {
+  clampComparePan();
+  const t = `translate(${cmpPanX}px, ${cmpPanY}px) scale(${cmpZoom})`;
+  document.getElementById("cmp-layer-left").style.transform = t;
+  document.getElementById("cmp-layer-right").style.transform = t;
+  const showPan = cmpZoom > CMP_MIN_ZOOM;
+  document.querySelectorAll(".cmp-pan").forEach(b => b.classList.toggle("show", showPan));
+  document.getElementById("cmp-zoom-out").disabled = cmpZoom <= CMP_MIN_ZOOM;
+  document.getElementById("cmp-zoom-in").disabled = cmpZoom >= CMP_MAX_ZOOM;
+}
+
+const cmpStage = document.getElementById("cmp-stage");
+function cmpPosFromEvent(e) {
+  const rect = cmpStage.getBoundingClientRect();
+  cmpPos = Math.min(Math.max((e.clientX - rect.left) / rect.width, 0), 1);
+  updateCompareDivider();
+}
+cmpStage.addEventListener("pointerdown", (e) => {
+  cmpDragging = true;
+  cmpStage.setPointerCapture(e.pointerId);
+  cmpPosFromEvent(e);
+});
+cmpStage.addEventListener("pointermove", (e) => { if (cmpDragging) cmpPosFromEvent(e); });
+cmpStage.addEventListener("pointerup", () => { cmpDragging = false; });
+cmpStage.addEventListener("pointercancel", () => { cmpDragging = false; });
+
+document.getElementById("cmp-zoom-in").addEventListener("click", () => {
+  cmpZoom = Math.min(cmpZoom + CMP_ZOOM_STEP, CMP_MAX_ZOOM);
+  updateCompareTransform();
+});
+document.getElementById("cmp-zoom-out").addEventListener("click", () => {
+  cmpZoom = Math.max(cmpZoom - CMP_ZOOM_STEP, CMP_MIN_ZOOM);
+  updateCompareTransform();
+});
+// Matches PhotoSliderCompareScreen's pan-button offsets exactly (up/left are
+// +step, down/right are -step) rather than the more "intuitive" inverse --
+// see that file's _clampPan doc comment for why.
+document.getElementById("cmp-pan-up").addEventListener("click", () => { cmpPanY += CMP_PAN_STEP; updateCompareTransform(); });
+document.getElementById("cmp-pan-down").addEventListener("click", () => { cmpPanY -= CMP_PAN_STEP; updateCompareTransform(); });
+document.getElementById("cmp-pan-left").addEventListener("click", () => { cmpPanX += CMP_PAN_STEP; updateCompareTransform(); });
+document.getElementById("cmp-pan-right").addEventListener("click", () => { cmpPanX -= CMP_PAN_STEP; updateCompareTransform(); });
+document.getElementById("cmp-close").addEventListener("click", closeCompare);
+window.addEventListener("resize", () => {
+  if (cmpGroup < 0) return;
+  sizeCompareLayers();
+  updateCompareDivider();
+  updateCompareTransform();
+});
+document.addEventListener("keydown", (e) => {
+  if (cmpGroup < 0) return;
+  if (e.key === "Escape") closeCompare();
+});
+
 // --- persistence: localStorage auto-save/restore, plus explicit export/import
 // so progress survives closing the tab, switching browsers, or the page
 // getting regenerated with the same underlying photos.
@@ -665,12 +1043,21 @@ function render() {
     div.className = "group" + (g.reviewed ? " reviewed" : "");
     const header = document.createElement("div");
     header.className = "group-header";
+    // Exactly 2 photos: only one possible pair, so a single one-click
+    // Compare button beats making the user tap two checkboxes. 3+ photos:
+    // no single obvious pair, so each card gets a purple stage-checkbox
+    // instead (ported from the Flutter app) -- tap two to compare them.
+    const twoPhotoGroup = g.items.length === 2;
     header.innerHTML = `<span class="title">Group ${gi+1} — ${g.ts}</span>
       <span class="meta">${g.items.length} photos</span>
+      ${twoPhotoGroup ? '<button class="cmp-open-btn" type="button">&#8644; Compare</button>' : ""}
       <label class="reviewed-toggle">
         <input type="checkbox" class="reviewed-cb" data-group="${gi}" ${g.reviewed ? "checked" : ""}>
         Reviewed
       </label>`;
+    if (twoPhotoGroup) {
+      header.querySelector(".cmp-open-btn").addEventListener("click", () => openCompare(gi, 0, 1));
+    }
     div.appendChild(header);
 
     const photosDiv = document.createElement("div");
@@ -689,12 +1076,20 @@ function render() {
              <input type="checkbox" ${it.marked ? "checked" : ""} data-group="${gi}" data-item="${ii}">
              Mark for deletion
            </label>`;
+      const staged = g.stagedForCompare === ii;
       card.innerHTML = `
-        ${ii === 0 ? '<span class="badge">BEST</span>' : ""}
-        ${it.already_deleted ? '<span class="badge deleted">DELETED</span>' : ""}
-        <img src="data:image/jpeg;base64,${it.thumb || ""}" loading="lazy">
+        <div class="photo-thumb-wrap">
+          ${ii === 0 ? '<span class="badge">BEST</span>' : ""}
+          ${it.already_deleted ? '<span class="badge deleted">DELETED</span>' : ""}
+          <img src="data:image/jpeg;base64,${it.thumb || ""}" loading="lazy">
+          ${!twoPhotoGroup ? `<button class="cmp-stage-btn${staged ? ' staged' : ''}" type="button"
+                  title="Select to compare">${staged ? '&#9745;' : '&#9744;'}</button>` : ""}
+        </div>
         <div class="photo-meta">${it.name}<br>${it.ts}<br>${(it.size_kb/1024).toFixed(1)} MB, score ${it.score.toFixed(0)}</div>
         ${checkboxHtml}`;
+      if (!twoPhotoGroup) {
+        card.querySelector(".cmp-stage-btn").addEventListener("click", () => handleCompareStageTap(gi, ii));
+      }
       photosDiv.appendChild(card);
     });
     div.appendChild(photosDiv);
@@ -885,9 +1280,21 @@ def scan():
     with SCAN_LOCK:
         if SCAN_STATE["running"]:
             return redirect(url_for("scan_status"))
-        SCAN_STATE.update({"running": True, "stage": "starting", "done": 0, "total": 0, "error": None})
+        now = time.time()
+        SCAN_STATE.update({
+            "running": True, "stage": "starting", "done": 0, "total": 0, "error": None,
+            "stage_started_at": now, "stage_baseline_done": 0,
+        })
+    _save_scan_root(path)
 
     def progress_cb(stage, done, total):
+        # Reset the per-stage clock/baseline on every stage transition (e.g.
+        # hashing -> scoring) so the ETA math below is based on how fast
+        # THIS stage is progressing, not skewed by whatever came before it
+        # or by items already cached from a previous, resumed run.
+        if SCAN_STATE.get("stage") != stage:
+            SCAN_STATE["stage_started_at"] = time.time()
+            SCAN_STATE["stage_baseline_done"] = done
         SCAN_STATE.update({"stage": stage, "done": done, "total": total})
 
     def worker():
@@ -900,6 +1307,14 @@ def scan():
                 workers=CONFIG["workers"], max_seconds=None,
                 progress_cb=progress_cb,
             )
+            try:
+                # A rescan is also the natural moment to clean up cache rows
+                # left behind by a purge/restore that happened before this
+                # folder had reconciliation wired up (or whose SSH call
+                # failed) -- best-effort, must not fail the scan itself.
+                _reconcile_deleted_cache(path)
+            except Exception:
+                pass
             SCAN_STATE["stage"] = "done"
         except Exception as e:
             SCAN_STATE["error"] = str(e)
@@ -910,11 +1325,37 @@ def scan():
     return redirect(url_for("scan_status"))
 
 
+def _fmt_duration(seconds):
+    seconds = max(int(seconds), 0)
+    if seconds < 60:
+        return f"{seconds}s"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}m {s}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m"
+
+
 @app.route("/scan/status")
 def scan_status():
     if not SCAN_STATE["running"] and SCAN_STATE["stage"] == "done" and not SCAN_STATE["error"]:
         return redirect(url_for("review"))
-    return render_template_string(STATUS_TEMPLATE, state=SCAN_STATE)
+
+    now = time.time()
+    stage_started_at = SCAN_STATE.get("stage_started_at") or now
+    stage_elapsed = now - stage_started_at
+    done, total = SCAN_STATE["done"], SCAN_STATE["total"]
+    baseline = SCAN_STATE.get("stage_baseline_done", 0)
+    progressed = max(done - baseline, 0)
+    eta = None
+    if progressed > 0 and total > done:
+        rate = stage_elapsed / progressed
+        eta = _fmt_duration(rate * (total - done))
+
+    return render_template_string(
+        STATUS_TEMPLATE, state=SCAN_STATE, scan_root=_load_scan_root(),
+        elapsed=_fmt_duration(stage_elapsed), eta=eta,
+    )
 
 
 @app.route("/")
@@ -945,7 +1386,10 @@ def review():
     # Escape "</" so a base64 thumbnail can never accidentally contain a
     # literal "</script>" and truncate the inline script block.
     groups_json_str = json.dumps(groups_json).replace("</", "<\\/")
+    scan_root = _load_scan_root() or ""
     html = HTML_TEMPLATE.replace("__GROUPS_JSON__", groups_json_str)
+    html = html.replace("__SCAN_ROOT__", str(escape(scan_root)))
+    html = html.replace("__RESCAN_ATTRS__", "" if scan_root else "disabled")
     return html
 
 
@@ -972,7 +1416,7 @@ def raw():
     if not path:
         abort(400)
     try:
-        data = _sftp_call(lambda sftp: remote_client.read_bytes(sftp, path))
+        data = _ssh_call(lambda client: remote_client.read_bytes(client, path))
     except Exception:
         abort(404)
     ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
@@ -1113,7 +1557,7 @@ def _trash_confirm(mode):
     if not path:
         abort(400)
     try:
-        summary = _sftp_call(lambda sftp: remote_client.count_trash(sftp, path))
+        summary = _ssh_call(lambda client: remote_client.count_trash(client, path))
         error = None
     except Exception as e:
         summary, error = None, str(e)
@@ -1126,10 +1570,15 @@ def do_purge():
     if not path:
         abort(400)
     try:
-        summary = _sftp_call(lambda sftp: remote_client.purge_trash(sftp, path))
+        summary = _ssh_call(lambda client: remote_client.purge_trash(client, path))
         error = None
     except Exception as e:
         summary, error = None, str(e)
+    if summary and not error:
+        try:
+            _reconcile_deleted_cache(path)
+        except Exception:
+            pass  # best-effort cache cleanup -- the purge itself already succeeded
     return render_template_string(TRASH_RESULT_TEMPLATE, mode="purge", path=path, summary=summary, error=error)
 
 
@@ -1139,10 +1588,15 @@ def do_restore():
     if not path:
         abort(400)
     try:
-        summary = _sftp_call(lambda sftp: remote_client.restore_trash(sftp, path))
+        summary = _remote_call(lambda sftp, client: remote_client.restore_trash(client, sftp, path))
         error = None
     except Exception as e:
         summary, error = None, str(e)
+    if summary and not error:
+        try:
+            _reconcile_deleted_cache(path)
+        except Exception:
+            pass  # best-effort cache cleanup -- the restore itself already succeeded
     return render_template_string(TRASH_RESULT_TEMPLATE, mode="restore", path=path, summary=summary, error=error)
 
 

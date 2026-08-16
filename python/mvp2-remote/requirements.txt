@@ -3,3 +3,4 @@ imagehash>=4.3.1
 numpy>=1.20.0
 paramiko>=3.0.0
 Flask>=2.3.0
+piexif>=1.1.3

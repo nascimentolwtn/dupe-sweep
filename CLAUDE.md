@@ -202,14 +202,24 @@ remote machine — no server or new dependency is installed there, just the
 `sshd` it's already reachable through.
 - `remote_client.py` — SSH/SFTP connect, recursive remote walks
   (`list_images` for photos, `list_files` for every file), folder-picker
-  listing (`list_subdirs`), prefetched bulk reads (`read_bytes`),
-  move-to-`_to_delete` with collision handling (`move_to_trash`), recursive
-  same-disk relocation for archive mode (`move_tree`), and cleanup of
-  `_to_delete` folders (`find_trash_dirs`, `count_trash`, `purge_trash`,
-  `restore_trash`).
+  listing (`list_subdirs`), move-to-`_to_delete` with collision handling
+  (`move_to_trash`), recursive same-disk relocation for archive mode
+  (`move_tree`). Cleanup of `_to_delete` folders (`find_trash_dirs`,
+  `count_trash`, `purge_trash`, `restore_trash`) and full-file reads
+  (`read_bytes`) run over **native SSH exec** (`find`/`rm`/`du`/`cat`), not
+  SFTP — walking a large root directory-by-directory over SFTP
+  (`listdir_attr` = one round trip per directory) took minutes on the real
+  netbook; the netbook's own `find` does it in seconds. SFTP stays for
+  browsing and scan/archive discovery (folder-scoped, not drive-wide) and
+  per-file rename/collision handling (fine-grained, doesn't fit a bulk
+  shell command).
 - `scan_remote.py` — staged, threaded, resumable hash → cluster → score →
   thumbnail pipeline (`run_scan()`, importable). CLI power-user shortcut:
   `python3 scan_remote.py <remote-folder> --host 192.168.4.36 --out-dir ./run`.
+  Hashing reads only a 200KB prefix per photo and hashes the JPEG's embedded
+  EXIF thumbnail (via `piexif`) instead of downloading the full multi-MB
+  file — falls back to a full download only when no embedded thumbnail
+  exists. ~19x faster against the real netbook.
 - `serve_review.py` — local Flask app, the single entry point
   (browse → scan → review → delete): `python3 serve_review.py --host 192.168.4.36 --out-dir ./run`,
   then open `http://127.0.0.1:5000/`. Also hosts **archive mode**
@@ -224,10 +234,21 @@ remote machine — no server or new dependency is installed there, just the
   equivalents) — since `/delete` only ever moves a file into `_to_delete`,
   this is where you either permanently remove those files (`purge`, the one
   irreversible operation in this tool) or move them back to where they were
-  deleted from (`restore`).
+  deleted from (`restore`). Each duplicate group also has a **Compare**
+  button: an overlapping before/after slider between two full-resolution
+  photos (drag/tap to move the divider, zoom+pan in lockstep, mark either
+  side for deletion), ported from the Flutter app's
+  `PhotoSliderCompareScreen` — a one-click button for 2-photo groups, a
+  purple stage-checkbox per photo (tap two to compare, also ported from
+  Flutter's `PhotoGroupCard`) for 3+. All SFTP/SSH calls share one
+  connection serialized behind a lock — neither `paramiko.SFTPClient` nor
+  overlapping exec commands on one `SSHClient` are thread-safe, and
+  concurrent requests (e.g. Compare's two full-res loads) can wedge a
+  shared channel rather than just error. The scan-status page shows elapsed
+  time and an ETA for the current stage.
 - Setup: `pip install -r python/mvp2-remote/requirements.txt` (adds
-  `paramiko`, `flask` on top of mvp1's deps). SSH key-based auth to the
-  remote machine is a prerequisite, set up outside this code.
+  `paramiko`, `flask`, `piexif` on top of mvp1's deps). SSH key-based auth
+  to the remote machine is a prerequisite, set up outside this code.
 - Same **move-to-`_to_delete`, never hard-delete** guarantee as
   `apply_delete_list.py`. See `python/mvp2-remote/README_MVP2.md` for the
   full divergence notes and the sync-folder caution: don't run a real

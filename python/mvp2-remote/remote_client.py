@@ -11,6 +11,7 @@ in python-mvp1/find_duplicate_photos.py and apply_delete_list.py, adapted
 for SFTP (which has no os.walk equivalent).
 """
 
+import shlex
 import stat
 import time
 from pathlib import PurePosixPath
@@ -20,6 +21,22 @@ import paramiko
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 EXCLUDE_PREFIXES = (".trashed-", ".temp-", ".pending-")
 TRASH_DIRNAME = "_to_delete"
+
+
+def _exec(client, cmd, timeout=120):
+    """Run `cmd` on the remote host via SSH exec (not SFTP) and return
+    (stdout_bytes, stderr_text, exit_code). Used for whole-tree operations
+    (find/rm/du) and bulk file reads (cat) -- these are dramatically faster
+    than SFTP's per-item request/response round trips: a `find` under a
+    large tree (e.g. purge/restore scanning for _to_delete folders) runs
+    natively on the netbook's own filesystem in one shot instead of
+    thousands of individual listdir_attr() calls over SFTP, one per
+    directory. SFTP is kept for folder *browsing* (list_subdirs, cheap and
+    interactive) and for the fine-grained per-file rename/collision
+    handling that move_to_trash/restore_trash/move_tree need."""
+    _in, out, err = client.exec_command(cmd, timeout=timeout)
+    rc = out.channel.recv_exit_status()
+    return out.read(), err.read().decode("utf-8", errors="replace"), rc
 
 
 def connect(host, port=22, username=None, key_filename=None, password=None):
@@ -117,14 +134,17 @@ def list_files(sftp, root):
         yield {"path": full, "size": entry.st_size, "mtime": entry.st_mtime}
 
 
-def read_bytes(sftp, remote_path):
-    """Read a whole remote file into memory, with .prefetch() so paramiko
-    pulls it in one bulk transfer instead of chunked one-round-trip-at-a-time
-    reads — the difference between usable and painfully slow when reading
-    full JPEGs over SSH to/from a weak netbook."""
-    with sftp.open(str(remote_path), "rb") as f:
-        f.prefetch()
-        return f.read()
+def read_bytes(client, remote_path):
+    """Read a whole remote file via SSH exec (`cat`) instead of SFTP --
+    streams raw bytes straight over the exec channel, skipping SFTP's
+    per-packet request/response framing, which matters for the multi-MB
+    full-resolution reads the review page's lightbox/Compare view do on top
+    of a slow netbook. Raises IOError (with the remote `cat`'s stderr) if
+    the file doesn't exist or isn't readable."""
+    data, err, rc = _exec(client, f"cat {shlex.quote(str(remote_path))}")
+    if rc != 0:
+        raise IOError(err.strip() or f"cat failed (exit {rc})")
+    return data
 
 
 def _exists(sftp, path):
@@ -241,28 +261,34 @@ def move_tree(sftp, src_root, dst_root, min_age_seconds=300, date_from=None, dat
     }
 
 
-def find_trash_dirs(sftp, root):
+def find_trash_dirs(client, root):
     """Every _to_delete folder anywhere under root, as a sorted list of
-    paths. move_to_trash() creates one per parent folder it's ever deleted
-    from, so these can be scattered throughout a tree rather than living in
-    one place."""
-    found = []
-    for full, _entry, is_dir in _walk_all(sftp, root):
-        if is_dir and full.rsplit("/", 1)[-1] == TRASH_DIRNAME:
-            found.append(full)
-    return sorted(found)
+    paths, via one native `find` call over SSH exec. move_to_trash()
+    creates one per parent folder it's ever deleted from, so these can be
+    scattered throughout a tree rather than living in one place -- and
+    root can be a large tree (the whole browse root, not just one photo
+    folder), which is exactly where the old per-directory SFTP walk used
+    to take minutes."""
+    cmd = f"find {shlex.quote(str(root))} -type d -name {shlex.quote(TRASH_DIRNAME)} 2>/dev/null"
+    out, _err, _rc = _exec(client, cmd)
+    return sorted(l for l in out.decode("utf-8", errors="replace").splitlines() if l.strip())
 
 
-def count_trash(sftp, root):
+def count_trash(client, root):
     """Preview for purge/restore: how many _to_delete folders, files, and
-    bytes are under root, without touching anything."""
-    trash_dirs = find_trash_dirs(sftp, root)
-    files = 0
-    total_bytes = 0
-    for d in trash_dirs:
-        for info in list_files(sftp, d):
-            files += 1
-            total_bytes += info["size"]
+    bytes are under root, without touching anything -- via native
+    find/du instead of walking every file over SFTP."""
+    trash_dirs = find_trash_dirs(client, root)
+    if not trash_dirs:
+        return {"dirs": 0, "files": 0, "bytes": 0}
+    quoted = " ".join(shlex.quote(d) for d in trash_dirs)
+    out, _err, _rc = _exec(client, f"find {quoted} -type f 2>/dev/null | wc -l")
+    files = int(out.decode().strip() or 0)
+    out, _err, _rc = _exec(
+        client,
+        f"find {quoted} -type f -printf '%s\\n' 2>/dev/null | awk '{{s+=$1}} END {{print s+0}}'",
+    )
+    total_bytes = int(out.decode().strip() or 0)
     return {"dirs": len(trash_dirs), "files": files, "bytes": total_bytes}
 
 
@@ -281,37 +307,29 @@ def _remove_empty_dirs(sftp, root):
             pass
 
 
-def purge_trash(sftp, root):
+def purge_trash(client, root):
     """Find every _to_delete folder under root and permanently remove its
-    contents -- the one genuinely destructive operation in this tool, kept
-    separate and opt-in from move_to_trash()'s move-not-delete default.
+    contents via native find + `rm -rf` over SSH exec -- the one genuinely
+    destructive operation in this tool, kept separate and opt-in from
+    move_to_trash()'s move-not-delete default. Counts files/bytes up front
+    (for the summary) since `rm -rf` itself doesn't report what it deleted.
     Returns a summary dict: dirs_purged, files_removed, bytes_removed,
     errors."""
-    trash_dirs = find_trash_dirs(sftp, root)
-    files_removed = 0
-    bytes_removed = 0
-    errors = []
+    trash_dirs = find_trash_dirs(client, root)
+    if not trash_dirs:
+        return {"dirs_purged": 0, "files_removed": 0, "bytes_removed": 0, "errors": []}
 
-    for trash_dir in trash_dirs:
-        sub_files = []
-        sub_dirs = [trash_dir]
-        for full, entry, is_dir in _walk_all(sftp, trash_dir):
-            if is_dir:
-                sub_dirs.append(full)
-            else:
-                sub_files.append((full, entry.st_size))
-        for path, size in sub_files:
-            try:
-                sftp.remove(path)
-                files_removed += 1
-                bytes_removed += size
-            except Exception as e:
-                errors.append((path, str(e)))
-        for d in sorted(sub_dirs, key=len, reverse=True):
-            try:
-                sftp.rmdir(d)
-            except Exception as e:
-                errors.append((d, str(e)))
+    quoted = " ".join(shlex.quote(d) for d in trash_dirs)
+    out, _err, _rc = _exec(client, f"find {quoted} -type f 2>/dev/null | wc -l")
+    files_removed = int(out.decode().strip() or 0)
+    out, _err, _rc = _exec(
+        client,
+        f"find {quoted} -type f -printf '%s\\n' 2>/dev/null | awk '{{s+=$1}} END {{print s+0}}'",
+    )
+    bytes_removed = int(out.decode().strip() or 0)
+
+    _out, err, rc = _exec(client, f"rm -rf {quoted}", timeout=300)
+    errors = [(root, err.strip())] if rc != 0 and err.strip() else []
 
     return {
         "dirs_purged": len(trash_dirs),
@@ -321,15 +339,35 @@ def purge_trash(sftp, root):
     }
 
 
-def restore_trash(sftp, root):
-    """Find every _to_delete folder under root and move each file back to
-    the folder it was deleted from (the parent of the _to_delete folder it
-    landed in) -- undoes move_to_trash(). Name collisions at the
-    destination (e.g. a same-named file recreated since the delete) get the
-    same _1/_2 suffix treatment as move_to_trash(). Now-empty _to_delete
-    folders are removed afterward. Returns a summary dict: restored,
-    restored_bytes, collisions_renamed, errors."""
-    trash_dirs = find_trash_dirs(sftp, root)
+def _list_files_native(client, root):
+    """Like list_files() but via one native `find` call instead of an SFTP
+    walk. Used for the files *within* a single already-found _to_delete
+    folder, which is typically small -- the expensive part was always
+    finding the _to_delete folders across the whole (possibly huge) root,
+    which find_trash_dirs() already fixed; this keeps restore_trash
+    consistent with the same native-find approach throughout."""
+    cmd = f"find {shlex.quote(str(root))} -type f -printf '%s %p\\n' 2>/dev/null"
+    out, _err, _rc = _exec(client, cmd)
+    for line in out.decode("utf-8", errors="replace").splitlines():
+        if not line.strip():
+            continue
+        size_str, path = line.split(" ", 1)
+        yield {"path": path, "size": int(size_str)}
+
+
+def restore_trash(client, sftp, root):
+    """Find every _to_delete folder under root (native find, see
+    find_trash_dirs) and move each file back to the folder it was deleted
+    from (the parent of the _to_delete folder it landed in) -- undoes
+    move_to_trash(). Name collisions at the destination (e.g. a same-named
+    file recreated since the delete) get the same _1/_2 suffix treatment as
+    move_to_trash(). Renames themselves stay on SFTP -- fine-grained,
+    per-file collision handling doesn't fit a bulk shell command, but each
+    individual rename is cheap; only the whole-tree discovery needed the
+    native-find fix. Now-empty _to_delete folders are removed afterward.
+    Returns a summary dict: restored, restored_bytes, collisions_renamed,
+    errors."""
+    trash_dirs = find_trash_dirs(client, root)
     restored = 0
     restored_bytes = 0
     collisions_renamed = 0
@@ -337,7 +375,7 @@ def restore_trash(sftp, root):
 
     for trash_dir in trash_dirs:
         parent = trash_dir.rsplit("/", 1)[0]
-        for info in list_files(sftp, trash_dir):
+        for info in _list_files_native(client, trash_dir):
             path = info["path"]
             rel = path[len(trash_dir):].lstrip("/")
             dest = f"{parent}/{rel}"

@@ -65,6 +65,7 @@ from pathlib import Path
 from PIL import Image, ImageOps
 import imagehash
 import numpy as np
+import piexif
 
 import remote_client
 
@@ -73,6 +74,14 @@ HASH_DISTANCE = 10
 THUMB_MAX_DIM = 280
 THUMB_QUALITY = 60
 SAVE_EVERY = 20  # cache-flush + progress-report cadence within a stage
+
+# Most camera/phone JPEGs embed a small preview thumbnail (commonly ~160x120,
+# a few KB) inside the EXIF APP1 marker, which the JPEG spec caps at 65533
+# bytes -- and that marker sits near the very start of the file, before the
+# multi-MB compressed image data. Reading just this prefix and hashing the
+# embedded thumbnail instead of the full photo is what makes hashing fast
+# over a weak netbook: see _hash_worker's comment for the full rationale.
+HASH_PREFIX_BYTES = 200 * 1024
 
 # The SSH key lives under the WSL filesystem on this machine, not the
 # Windows user's own ~/.ssh (which paramiko searches by default when no
@@ -110,6 +119,13 @@ class ConnectionPool:
             self._local.sftp = client.open_sftp()
         return self._local.sftp
 
+    def get_client(self):
+        """The underlying SSHClient for this thread's connection (for
+        native exec commands like remote_client.read_bytes's `cat`, faster
+        than SFTP for bulk full-file reads)."""
+        self.get_sftp()  # ensures the connection is established
+        return self._local.client
+
 
 def cluster_by_time(items, window_seconds: int):
     items = sorted(items, key=lambda x: x["ts"])
@@ -146,33 +162,88 @@ def split_by_similarity(cluster, hash_distance: int):
     return [g for g in groups if len(g) > 1]
 
 
+def _read_prefix(sftp, remote_path, n):
+    """Read up to the first `n` bytes of a remote file -- NOT the whole
+    file. Returns (data, is_whole_file): is_whole_file is True when fewer
+    than `n` bytes came back, meaning EOF was hit and `data` already IS the
+    complete file (so a caller needing the full image can skip re-fetching
+    it)."""
+    with sftp.open(str(remote_path), "rb") as f:
+        data = f.read(n)
+    return data, len(data) < n
+
+
+def _exif_timestamp(exif):
+    if not exif:
+        return None
+    try:
+        exif_ifd = exif.get_ifd(EXIF_IFD_TAG)
+    except Exception:
+        exif_ifd = {}
+    raw = exif_ifd.get(DATETIME_ORIGINAL_TAG) or exif.get(DATETIME_TOPLEVEL_TAG)
+    if not raw:
+        return None
+    try:
+        return datetime.strptime(raw, "%Y:%m:%d %H:%M:%S")
+    except Exception:
+        return None
+
+
+def _embedded_thumb_bytes(prefix_data):
+    """Best-effort: pull the small EXIF-embedded preview JPEG out of a
+    (possibly truncated) file prefix via piexif, without needing the rest of
+    the photo. Returns the thumbnail's raw JPEG bytes, or None if this file
+    doesn't have one (piexif.load also just raises on non-JPEG/odd input,
+    e.g. PNGs -- caught the same way)."""
+    try:
+        thumb = piexif.load(prefix_data).get("thumbnail")
+        return thumb if thumb else None
+    except Exception:
+        return None
+
+
 def _hash_worker(pool, file_info, remote_path):
-    """Single SFTP open gets both the EXIF timestamp and perceptual hash.
-    Size/mtime come from the walk's listdir_attr (file_info), no extra
-    stat() round-trip needed."""
+    """Gets both the EXIF timestamp and perceptual hash from as little data
+    as possible. Size/mtime come from the walk's listdir_attr (file_info),
+    no extra stat() round-trip needed.
+
+    The old version downloaded the ENTIRE photo just to compute a 64x64
+    grayscale hash -- multiple MB over SSH to a weak, single-core netbook,
+    per photo. Almost every camera/phone JPEG already embeds a small preview
+    thumbnail in its EXIF data (see HASH_PREFIX_BYTES), so this reads only a
+    bounded prefix, extracts that thumbnail, and hashes IT instead -- full
+    download only happens as a fallback when no embedded thumbnail exists.
+    Timestamp extraction was already effectively free (EXIF headers are
+    always in that same prefix), so it now runs on the prefix too instead of
+    needing the full file to be open."""
     info = file_info[remote_path]
     sftp = pool.get_sftp()
     ts = None
     phash = None
     try:
-        data = remote_client.read_bytes(sftp, remote_path)
-        with Image.open(io.BytesIO(data)) as img:
-            exif = img.getexif()
-            if exif:
-                try:
-                    exif_ifd = exif.get_ifd(EXIF_IFD_TAG)
-                except Exception:
-                    exif_ifd = {}
-                raw = exif_ifd.get(DATETIME_ORIGINAL_TAG) or exif.get(DATETIME_TOPLEVEL_TAG)
-                if raw:
-                    try:
-                        ts = datetime.strptime(raw, "%Y:%m:%d %H:%M:%S")
-                    except Exception:
-                        ts = None
-            # draft() only helps JPEGs and only reduces decode scale, never
-            # increases it beyond the source size, so it's always safe to call
-            img.draft("L", (64, 64))
-            phash = imagehash.phash(img)
+        prefix, is_whole_file = _read_prefix(sftp, remote_path, HASH_PREFIX_BYTES)
+        try:
+            with Image.open(io.BytesIO(prefix)) as hdr_img:
+                ts = _exif_timestamp(hdr_img.getexif())
+        except Exception:
+            pass
+
+        thumb_bytes = _embedded_thumb_bytes(prefix)
+        if thumb_bytes:
+            try:
+                with Image.open(io.BytesIO(thumb_bytes)) as timg:
+                    phash = imagehash.phash(timg)
+            except Exception:
+                phash = None
+
+        if phash is None:
+            full_data = prefix if is_whole_file else remote_client.read_bytes(pool.get_client(), remote_path)
+            with Image.open(io.BytesIO(full_data)) as img:
+                # draft() only helps JPEGs and only reduces decode scale,
+                # never increases it beyond the source size, so it's always
+                # safe to call
+                img.draft("L", (64, 64))
+                phash = imagehash.phash(img)
     except Exception:
         pass
     if ts is None:
@@ -183,9 +254,8 @@ def _hash_worker(pool, file_info, remote_path):
 def _score_worker(pool, remote_path):
     """Sharpness (Laplacian variance) + exposure penalty from a single
     remote read, mirroring python-mvp1's score_photo()."""
-    sftp = pool.get_sftp()
     try:
-        data = remote_client.read_bytes(sftp, remote_path)
+        data = remote_client.read_bytes(pool.get_client(), remote_path)
         with Image.open(io.BytesIO(data)) as img:
             img.draft("L", (512, 512))
             gray = np.asarray(img.convert("L").resize((512, 512)), dtype=np.float64)
@@ -212,9 +282,8 @@ def _score_worker(pool, remote_path):
 
 def _thumb_worker(pool, remote_path):
     """Mirrors python-mvp1/build_review_html.py's make_thumb_b64()."""
-    sftp = pool.get_sftp()
     try:
-        data = remote_client.read_bytes(sftp, remote_path)
+        data = remote_client.read_bytes(pool.get_client(), remote_path)
         with Image.open(io.BytesIO(data)) as img:
             img.draft("RGB", (THUMB_MAX_DIM * 2, THUMB_MAX_DIM * 2))
             img = ImageOps.exif_transpose(img)
