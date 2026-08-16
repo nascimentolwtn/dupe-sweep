@@ -31,7 +31,10 @@ the Dart app).
   `read_bytes()` (bulk full-file reads, SFTP with `.prefetch()`),
   `move_to_trash()` (move-not-delete, with a `_1`/`_2` collision suffix
   instead of overwriting), `move_tree()` (recursive same-disk relocation
-  for archive mode, see below). `find_trash_dirs()`/`count_trash()`/
+  for archive mode, see below), `move_grouped()` (same-disk relocation into
+  explicit named destination folders instead of one relative-structure
+  mirror — archive mode's "group into events" flow, see below).
+  `find_trash_dirs()`/`count_trash()`/
   `purge_trash()`/`restore_trash()` (see Purge/restore mode below) run over
   **native SSH exec** (`find`/`rm`/`du`) instead of SFTP — see "Why native
   SSH exec, not SFTP" below (and why `read_bytes()` deliberately does
@@ -58,16 +61,36 @@ the Dart app).
   and are unaffected — but they only run on photos that end up in a
   duplicate group, a small fraction of a typical library, so this was never
   the bottleneck.
+
+  Also holds `scan_events()`, a second staged pipeline for archive mode's
+  "group into events" flow (see below): timestamps and thumbnails *every*
+  photo under the chosen folder (not just ones in a duplicate group, since
+  every photo needs to show up in that flow's review grid), writing/
+  resuming its own `event_ts_cache.json`/`event_thumb_cache.json` kept
+  separate from the dedup caches above. `cluster_events()` is the gap-based
+  event-splitting logic (deliberately not a reuse of `cluster_by_time()`,
+  which drops single-photo clusters — wrong here, every photo needs to land
+  in *some* event).
 - `serve_review.py` — local Flask app (runs on this PC, not the netbook):
   browse the netbook's folders, kick off a scan, review duplicate groups
   with embedded thumbnails, and delete straight from the page (delete goes
   over SSH to the netbook immediately, no CSV/apply-step round trip); also
   hosts archive mode (`/archive/browse`, `/archive/confirm`, `POST
-  /archive` — see below) and purge/restore mode (`/purge/browse`,
+  /archive`, and the "group into events" sub-flow `/archive/events/scan`,
+  `/archive/events/review`, `/archive/events/confirm` — see below) and
+  purge/restore mode (`/purge/browse`,
   `/purge/confirm`, `POST /purge`, `/restore/browse`, `/restore/confirm`,
   `POST /restore` — see below). The review page header shows the folder
   currently being worked on and has a **Re-scan** button that re-runs the
-  scan against that same folder (merging with what's already cached). Each
+  scan against that same folder (merging with what's already cached). The
+  review page only ever displays groups for the folder actually scanned
+  (`_build_groups`'s `scope_root` param, matched against `hash_cache.json`
+  paths by prefix) — `hash_cache.json` itself accumulates every photo ever
+  scanned into this `--out-dir`, across however many different folders, so
+  without this the review page would keep showing whichever folder was
+  scanned *first* forever, since nothing else ever prunes old entries and
+  scanning a second folder just adds to the same cache rather than
+  replacing it. Each
   group also has a **Compare** button — an overlapping before/after slider
   between two full-resolution photos (drag or tap to move the divider, zoom
   and pan in lockstep on both sides, mark either side for deletion), ported
@@ -249,6 +272,61 @@ allow read/write/rename freely. This doesn't affect normal operation
 (archive mode only *reads* mtimes, never sets them), but it's worth
 knowing if you ever need to construct test fixtures with specific
 timestamps against this netbook.
+
+## Archive mode: group into events
+
+Plain archive mode (above) treats the whole chosen folder as one unit —
+fine when it's already one coherent occasion, which describes most
+existing folders under `--archive-root`. It falls short for a flat,
+undated dump folder (e.g. a raw sync folder with months of unrelated
+photos in it): moving it wholesale would just relocate one giant
+undifferentiated folder instead of matching the event-per-folder layout
+the rest of `--archive-root` already has.
+
+`/archive/confirm` has a second button, **"Group into events first"**,
+next to the regular "Confirm: move" button, for exactly this case:
+
+1. **`POST /archive/events/scan`** — kicks off `scan_remote.scan_events()`
+   on a background thread (same pattern as the main `/scan`): timestamps
+   every photo (EXIF, falling back to mtime) and thumbnails every photo
+   under the chosen folder — not just duplicates, every one, since the
+   next step needs to show them all.
+2. **`/archive/events/scan/status`** — auto-refreshing progress page, hands
+   off to the review page when done.
+3. **`/archive/events/review`** — the chosen folder's photos are
+   auto-clustered into candidate Events by a time gap (default 12h between
+   consecutive photo timestamps starts a new event) and shown as a
+   thumbnail grid, one card per event. Non-photo files (video, sidecars)
+   are bundled into whichever event's date range contains them (nearest
+   event if in a gap). Everything from here is client-side JS against the
+   full per-file dataset embedded in the page (same pattern the main
+   review page uses) — no server round-trip until you confirm:
+   - change the gap-hours input and hit **Recluster** to redo the split
+     from scratch,
+   - **Merge with previous event** to fold one event into its neighbor,
+   - per-photo **&larr;/&rarr;** buttons to nudge a stray photo into the
+     adjacent event,
+   - per-photo **skip** checkbox to leave a file behind, unmoved,
+   - each event's name is auto-suggested from its date range
+     (`YYYY-MM-DD`, or `YYYY-MM-DD to YYYY-MM-DD` if it spans multiple
+     days) and freely editable.
+4. **`POST /archive/events/confirm`** — takes the exact edited grouping
+   (`{"events": [{"name": ..., "paths": [...]}]}`, nothing recomputed
+   server-side) and moves each event's files into
+   `--archive-root/<sanitized name>/` via `remote_client.move_grouped()` —
+   flat, a sibling to your other event folders, not nested under the
+   source folder's name. Same still-syncing guard
+   (`--archive-min-age-seconds`) and `_1`/`_2` collision-rename safety as
+   plain archive mode. Two events that sanitize to the same name simply
+   share that destination folder. Returns a per-event summary (moved
+   count/bytes, skipped-recent, collision-renamed, errors), rendered
+   client-side.
+
+Scale note: the review page inlines every photo's base64 thumbnail in one
+response, same as the main review page — fine for hundreds to a few
+thousand photos, but a folder with tens of thousands would make that page
+heavy. No pagination yet (the main review page doesn't have it either);
+revisit if a real folder turns out to be too large in practice.
 
 ## Purge/restore mode: deleted photos are only ever moved, never unlinked
 

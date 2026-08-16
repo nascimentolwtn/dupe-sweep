@@ -23,6 +23,15 @@ Routes:
                             (+ optional date_from/date_to) before moving
   POST /archive             moves the confirmed folder from --sync-root
                             into --archive-root via remote_client.move_tree()
+  POST /archive/events/scan     kicks off scan_remote.scan_events() (timestamps +
+                                 thumbnails for every photo under the chosen folder)
+  GET  /archive/events/scan/status  progress page, redirects to the review page when done
+  GET  /archive/events/review       thumbnail-grid review UI: auto-clusters photos into
+                                     candidate Events by a time gap (adjustable live in
+                                     JS -- recluster/merge/move-file/exclude/rename), only
+                                     the final edited grouping is sent to confirm
+  POST /archive/events/confirm      {events: [{name, paths}]} -> moves each event's files
+                                     into --archive-root/<name>/ via remote_client.move_grouped()
   GET  /purge/browse        folder-picker UI rooted at --start-path, for
                             picking a subtree to purge _to_delete folders in
   GET  /purge/confirm       preview: how many _to_delete folders/files/bytes
@@ -60,7 +69,9 @@ from markupsafe import escape
 
 import remote_client
 import scan_remote
-from scan_remote import cluster_by_time, run_scan, split_by_similarity
+from scan_remote import (
+    EVENT_GAP_SECONDS, cluster_by_time, cluster_events, run_scan, scan_events, split_by_similarity,
+)
 
 # The SSH key lives under the WSL filesystem on this machine, not the
 # Windows user's own ~/.ssh (which paramiko searches by default when no
@@ -79,6 +90,15 @@ SCAN_LOCK = threading.Lock()
 SCAN_STATE = {
     "running": False, "stage": None, "done": 0, "total": 0, "error": None,
     "stage_started_at": None, "stage_baseline_done": 0,
+}
+
+# Archive mode's "group into events" flow -- separate lock/state from
+# SCAN_STATE above so a dedup scan and an event scan don't collide if
+# both are kicked off around the same time.
+EVENT_SCAN_LOCK = threading.Lock()
+EVENT_SCAN_STATE = {
+    "running": False, "stage": None, "done": 0, "total": 0, "error": None,
+    "stage_started_at": None, "stage_baseline_done": 0, "root": None,
 }
 
 _client_lock = threading.Lock()
@@ -263,6 +283,26 @@ def _save_scan_root(path):
         json.dump({"path": path}, f)
 
 
+def _event_scan_result_file():
+    return Path(CONFIG["out_dir"]) / "event_scan_result.json"
+
+
+def _load_event_scan_result():
+    p = _event_scan_result_file()
+    if p.exists():
+        try:
+            with open(p, encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
+
+
+def _save_event_scan_result(data):
+    with open(_event_scan_result_file(), "w", encoding="utf-8") as f:
+        json.dump(data, f)
+
+
 BROWSE_TEMPLATE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Browse netbook folders</title>
 <style>
@@ -413,8 +453,13 @@ ARCHIVE_CONFIRM_TEMPLATE = """<!doctype html>
     <label>From date (optional): <input type="date" name="date_from" value="{{ date_from }}"></label>
     <label>To date (optional): <input type="date" name="date_to" value="{{ date_to }}"></label>
     <button type="submit" class="secondary">Update count for this date range</button>
+    <button type="submit" formaction="{{ url_for('archive_events_scan') }}" formmethod="post"
+            style="background:#7c3aed;color:#fff">Group into events first</button>
     <button type="submit" formaction="{{ url_for('do_archive') }}" formmethod="post" class="danger">Confirm: move these files to archive</button>
   </form>
+  <p style="font-size:12px;color:#666;margin-top:10px">"Group into events" is for a flat, undated dump of
+    photos (like a raw sync folder) -- it splits them into per-occasion albums with a thumbnail review
+    before moving. If this folder is already one coherent event, just confirm the move directly above.</p>
   <a class="back" href="{{ url_for('archive_browse', path=path) }}">&larr; back to browse</a>
 </main>
 </body></html>
@@ -453,6 +498,271 @@ ARCHIVE_RESULT_TEMPLATE = """<!doctype html>
   {% endif %}
   <a class="back" href="{{ url_for('archive_browse') }}">&larr; back to archive browse</a>
 </main>
+</body></html>
+"""
+
+# Archive mode's "group into events" review page: mirrors HTML_TEMPLATE's
+# pattern of embedding the full per-file dataset as JSON and doing all
+# interactivity in JS against it, only POSTing the final edited result.
+# Clustering itself is recomputed client-side (cluster_events()'s sort/
+# split logic reimplemented in JS) so changing the gap threshold or
+# merging/moving files is instant, no server round-trip.
+EVENT_REVIEW_TEMPLATE = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Group into events</title>
+<style>
+  :root { color-scheme: light; }
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #f4f5f7; color: #1d1f24; }
+  header { position: sticky; top: 0; background: #1d1f24; color: #fff; padding: 14px 20px; z-index: 10;
+           display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; }
+  header .path { font-size: 12px; opacity: 0.7; font-family: ui-monospace, Consolas, monospace; word-break: break-all; }
+  header .gap-control { display: flex; align-items: center; gap: 6px; font-size: 13px; margin-left: auto; }
+  header .gap-control input { width: 60px; padding: 5px 6px; border-radius: 6px; border: none; }
+  header button { background: #3b82f6; color: #fff; border: none; padding: 8px 14px; border-radius: 6px;
+                  font-size: 13px; cursor: pointer; }
+  header button.secondary { background: #444a55; }
+  header button.danger { background: #dc2626; }
+  header button:hover:not(:disabled) { filter: brightness(1.1); }
+  header button:disabled { opacity: 0.5; cursor: default; }
+  main { padding: 16px; max-width: 1400px; margin: 0 auto; }
+  .event-card { background: #fff; border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; box-shadow: 0 1px 2px rgba(0,0,0,.06); }
+  .event-header { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }
+  .event-header input.event-name { font-size: 14px; font-weight: 600; padding: 6px 8px; border-radius: 6px;
+                                     border: 1px solid #ccc; min-width: 240px; flex: 0 1 320px; }
+  .event-meta { font-size: 12px; color: #666; }
+  .event-header .merge-btn { margin-left: auto; background: #444a55; color: #fff; border: none;
+                              padding: 6px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; }
+  .event-header .merge-btn:hover { filter: brightness(1.1); }
+  .files { display: flex; gap: 12px; flex-wrap: wrap; }
+  .file-card { width: 170px; border: 2px solid transparent; border-radius: 8px; padding: 6px; position: relative; }
+  .file-card.excluded { opacity: 0.4; }
+  .file-card img { width: 100%; height: 150px; object-fit: cover; border-radius: 6px; display: block; background: #eee; }
+  .file-card .no-thumb { width: 100%; height: 150px; border-radius: 6px; background: #e5e7eb; display: flex;
+                          align-items: center; justify-content: center; font-size: 28px; color: #9ca3af; }
+  .file-meta { font-size: 10.5px; color: #555; margin-top: 5px; line-height: 1.3; word-break: break-all; }
+  .file-controls { display: flex; align-items: center; justify-content: space-between; margin-top: 4px; }
+  .file-controls label { font-size: 11px; display: flex; align-items: center; gap: 4px; }
+  .file-nav { display: flex; gap: 4px; }
+  .file-nav button { background: #eee; border: none; width: 22px; height: 22px; border-radius: 4px;
+                      cursor: pointer; font-size: 12px; line-height: 1; }
+  .file-nav button:hover:not(:disabled) { background: #ddd; }
+  .file-nav button:disabled { opacity: 0.3; cursor: default; }
+  .empty { text-align: center; padding: 40px; color: #888; }
+  .result-row { padding: 10px 0; border-bottom: 1px solid #eee; font-size: 13px; }
+  .result-row .err { color: #ef4444; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Group into events</h1>
+  <span class="path">__SCAN_ROOT__</span>
+  <div class="gap-control">
+    <label for="gap-input">Split events after a gap of</label>
+    <input type="number" id="gap-input" min="1" step="1" value="__GAP_HOURS__">
+    <span>hours</span>
+    <button id="recluster-btn" class="secondary">Recluster</button>
+  </div>
+  <button id="confirm-btn" class="danger">Confirm: move these events to archive</button>
+</header>
+<main id="main"></main>
+<script>
+const ALL_FILES = __FILES_JSON__;
+const ARCHIVE_ROOT = __ARCHIVE_ROOT_JSON__;
+let STATE = [];
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+
+function suggestName(startTs, endTs) {
+  const fmt = t => new Date(t).toISOString().slice(0, 10);
+  const a = fmt(startTs), b = fmt(endTs);
+  return a === b ? a : `${a} to ${b}`;
+}
+
+function clusterEvents(files, gapSeconds) {
+  const images = files.filter(f => f.is_image).slice().sort((a, b) => a.tsMs - b.tsMs);
+  const clusters = [];
+  let current = [];
+  for (const f of images) {
+    if (current.length && (f.tsMs - current[current.length - 1].tsMs) / 1000 > gapSeconds) {
+      clusters.push(current);
+      current = [];
+    }
+    current.push(f);
+  }
+  if (current.length) clusters.push(current);
+
+  const events = clusters.map(c => ({
+    startTs: c[0].tsMs, endTs: c[c.length - 1].tsMs, files: c.slice(),
+  }));
+
+  const others = files.filter(f => !f.is_image);
+  for (const o of others) {
+    if (events.length === 0) {
+      events.push({startTs: o.tsMs, endTs: o.tsMs, files: []});
+    }
+    let best = 0, bestDist = Infinity;
+    events.forEach((e, i) => {
+      const dist = (o.tsMs >= e.startTs && o.tsMs <= e.endTs) ? 0
+        : Math.min(Math.abs(o.tsMs - e.startTs), Math.abs(o.tsMs - e.endTs));
+      if (dist < bestDist) { bestDist = dist; best = i; }
+    });
+    events[best].files.push(o);
+  }
+
+  events.forEach(e => {
+    e.files.sort((a, b) => a.tsMs - b.tsMs);
+    e.name = suggestName(e.startTs, e.endTs);
+  });
+  return events;
+}
+
+function fileCardHtml(f) {
+  const thumb = f.is_image
+    ? `<img src="data:image/jpeg;base64,${f.thumb || ''}" loading="lazy">`
+    : `<div class="no-thumb">&#128206;</div>`;
+  return `
+    <div class="file-card ${f.excluded ? 'excluded' : ''}" data-path="${escapeHtml(f.path)}">
+      ${thumb}
+      <div class="file-meta">${escapeHtml(f.name)}<br>${f.ts.replace('T', ' ').slice(0, 16)}</div>
+      <div class="file-controls">
+        <label><input type="checkbox" data-action="toggle-exclude" ${f.excluded ? 'checked' : ''}> skip</label>
+        <div class="file-nav">
+          <button data-action="move-prev" title="Move to previous event">&larr;</button>
+          <button data-action="move-next" title="Move to next event">&rarr;</button>
+        </div>
+      </div>
+    </div>`;
+}
+
+function eventCardHtml(e, i, total) {
+  const files = e.files.map(fileCardHtml).join('');
+  return `
+    <section class="event-card" data-event-index="${i}">
+      <div class="event-header">
+        <input class="event-name" data-action="rename" value="${escapeHtml(e.name)}">
+        <span class="event-meta">${e.files.length} file(s), ${suggestName(e.startTs, e.endTs)}</span>
+        ${i > 0 ? '<button class="merge-btn" data-action="merge-prev">Merge with previous event</button>' : ''}
+      </div>
+      <div class="files">${files}</div>
+    </section>`;
+}
+
+function render() {
+  const main = document.getElementById('main');
+  if (!STATE.length) {
+    main.innerHTML = '<div class="empty">No files found for this folder/date range.</div>';
+    return;
+  }
+  main.innerHTML = STATE.map((e, i) => eventCardHtml(e, i, STATE.length)).join('');
+}
+
+function recluster() {
+  const hours = parseFloat(document.getElementById('gap-input').value) || 12;
+  STATE = clusterEvents(ALL_FILES, hours * 3600);
+  render();
+}
+
+function mergeWithPrevious(idx) {
+  if (idx <= 0) return;
+  STATE[idx - 1].files = STATE[idx - 1].files.concat(STATE[idx].files);
+  STATE.splice(idx, 1);
+  render();
+}
+
+function moveFile(idx, path, dir) {
+  const target = idx + dir;
+  if (target < 0 || target >= STATE.length) return;
+  const arr = STATE[idx].files;
+  const fi = arr.findIndex(f => f.path === path);
+  if (fi < 0) return;
+  const [f] = arr.splice(fi, 1);
+  STATE[target].files.push(f);
+  STATE[target].files.sort((a, b) => a.tsMs - b.tsMs);
+  if (STATE[idx].files.length === 0) STATE.splice(idx, 1);
+  render();
+}
+
+document.getElementById('recluster-btn').addEventListener('click', recluster);
+
+document.getElementById('main').addEventListener('click', (ev) => {
+  const btn = ev.target.closest('[data-action]');
+  if (!btn) return;
+  const card = ev.target.closest('.event-card');
+  if (!card) return;
+  const idx = parseInt(card.dataset.eventIndex, 10);
+  const action = btn.dataset.action;
+  if (action === 'merge-prev') {
+    mergeWithPrevious(idx);
+  } else if (action === 'move-prev' || action === 'move-next') {
+    const path = ev.target.closest('.file-card').dataset.path;
+    moveFile(idx, path, action === 'move-prev' ? -1 : 1);
+  }
+});
+
+document.getElementById('main').addEventListener('input', (ev) => {
+  if (ev.target.dataset.action !== 'rename') return;
+  const card = ev.target.closest('.event-card');
+  STATE[parseInt(card.dataset.eventIndex, 10)].name = ev.target.value;
+});
+
+document.getElementById('main').addEventListener('change', (ev) => {
+  if (ev.target.dataset.action !== 'toggle-exclude') return;
+  const card = ev.target.closest('.event-card');
+  const idx = parseInt(card.dataset.eventIndex, 10);
+  const path = ev.target.closest('.file-card').dataset.path;
+  const f = STATE[idx].files.find(x => x.path === path);
+  if (f) f.excluded = ev.target.checked;
+});
+
+document.getElementById('confirm-btn').addEventListener('click', async () => {
+  const events = STATE
+    .map(e => ({ name: e.name, paths: e.files.filter(f => !f.excluded).map(f => f.path) }))
+    .filter(e => e.paths.length > 0);
+  if (!events.length) { alert('Nothing to move -- everything is marked "skip".'); return; }
+  if (!confirm(`Move ${events.length} event(s) into ${ARCHIVE_ROOT}?`)) return;
+
+  const btn = document.getElementById('confirm-btn');
+  btn.disabled = true;
+  btn.textContent = 'Moving...';
+  document.getElementById('recluster-btn').disabled = true;
+  try {
+    const resp = await fetch('/archive/events/confirm', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({events}),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Move failed');
+    renderResult(data.summaries);
+    btn.textContent = 'Done';
+  } catch (e) {
+    alert('Move failed: ' + e.message);
+    btn.disabled = false;
+    btn.textContent = 'Confirm: move these events to archive';
+    document.getElementById('recluster-btn').disabled = false;
+  }
+});
+
+function renderResult(summaries) {
+  const main = document.getElementById('main');
+  main.innerHTML = summaries.map(s => {
+    const mb = (s.moved_bytes / (1024 * 1024)).toFixed(1);
+    const errs = s.errors && s.errors.length
+      ? `<div class="err">${s.errors.length} error(s): ${s.errors.map(e => escapeHtml(e[0] + ': ' + e[1])).join('; ')}</div>`
+      : '';
+    return `<div class="result-row"><strong>${escapeHtml(s.name)}</strong> &rarr; <code>${escapeHtml(s.dest)}</code><br>
+      Moved ${s.moved} file(s) (${mb} MB). Skipped (still syncing): ${s.skipped_recent}.
+      Collision-renamed: ${s.skipped_collision_renamed}.${errs}</div>`;
+  }).join('') + '<p style="margin-top:16px"><a href="/archive/browse">&larr; back to archive browse</a></p>';
+}
+
+for (const f of ALL_FILES) { f.tsMs = new Date(f.ts).getTime(); }
+recluster();
+</script>
 </body></html>
 """
 
@@ -1228,9 +1538,20 @@ render();
 """
 
 
-def _build_groups(hash_cache, score_cache, thumb_cache, deleted, time_window, hash_distance):
+def _build_groups(hash_cache, score_cache, thumb_cache, deleted, time_window, hash_distance, scope_root=None):
+    """`hash_cache` accumulates every photo ever scanned into this out_dir,
+    across however many different folders -- re-scanning folder B after
+    folder A doesn't remove A's entries, it just adds B's. Without
+    `scope_root`, the review page would keep showing every folder ever
+    scanned in this session merged together (and since nothing ever prunes
+    it, whichever folder was scanned first tends to dominate, making later
+    folders look like they never took effect). `scope_root` limits this
+    build to photos under the folder actually being reviewed right now."""
+    root_prefix = f"{scope_root.rstrip('/')}/" if scope_root else None
     items = []
     for path, e in hash_cache.items():
+        if root_prefix and not path.startswith(root_prefix):
+            continue
         items.append({
             "path": path,
             "ts": datetime.fromisoformat(e["ts"]),
@@ -1390,16 +1711,17 @@ def review():
         with open(out_dir / "thumb_cache.json", encoding="utf-8") as f:
             thumb_cache = json.load(f)
     deleted = _load_deleted_paths()
+    scan_root = _load_scan_root() or ""
 
     groups_json = _build_groups(
         hash_cache, score_cache, thumb_cache, deleted,
         CONFIG["time_window"], CONFIG["hash_distance"],
+        scope_root=scan_root,
     )
 
     # Escape "</" so a base64 thumbnail can never accidentally contain a
     # literal "</script>" and truncate the inline script block.
     groups_json_str = json.dumps(groups_json).replace("</", "<\\/")
-    scan_root = _load_scan_root() or ""
     html = HTML_TEMPLATE.replace("__GROUPS_JSON__", groups_json_str)
     html = html.replace("__SCAN_ROOT__", str(escape(scan_root)))
     html = html.replace("__RESCAN_ATTRS__", "" if scan_root else "disabled")
@@ -1530,6 +1852,144 @@ def do_archive():
             error = str(e)
 
     return render_template_string(ARCHIVE_RESULT_TEMPLATE, path=path, dest=dest_root, summary=summary, error=error)
+
+
+@app.route("/archive/events/scan", methods=["POST"])
+def archive_events_scan():
+    path = request.form.get("path")
+    if not path:
+        abort(400)
+    date_from_str = request.form.get("date_from", "")
+    date_to_str = request.form.get("date_to", "")
+    date_from_ts, date_to_ts, date_error = _parse_date_range(date_from_str, date_to_str)
+    if date_error:
+        abort(400, date_error)
+
+    with EVENT_SCAN_LOCK:
+        if EVENT_SCAN_STATE["running"]:
+            return redirect(url_for("archive_events_scan_status"))
+        now = time.time()
+        EVENT_SCAN_STATE.update({
+            "running": True, "stage": "starting", "done": 0, "total": 0, "error": None,
+            "stage_started_at": now, "stage_baseline_done": 0, "root": path,
+        })
+
+    def progress_cb(stage, done, total):
+        if EVENT_SCAN_STATE.get("stage") != stage:
+            EVENT_SCAN_STATE["stage_started_at"] = time.time()
+            EVENT_SCAN_STATE["stage_baseline_done"] = done
+        EVENT_SCAN_STATE.update({"stage": stage, "done": done, "total": total})
+
+    def worker():
+        try:
+            result = scan_events(
+                path, CONFIG["out_dir"],
+                host=CONFIG["host"], port=CONFIG["port"], username=CONFIG["username"],
+                key_filename=CONFIG["key_filename"], password=CONFIG["password"],
+                date_from=date_from_ts, date_to=date_to_ts,
+                workers=CONFIG["workers"], max_seconds=None,
+                progress_cb=progress_cb,
+            )
+            if result["status"] == "complete":
+                _save_event_scan_result({
+                    "root": path, "images": result["images"], "others": result["others"],
+                })
+            EVENT_SCAN_STATE["stage"] = "done"
+        except Exception as e:
+            EVENT_SCAN_STATE["error"] = str(e)
+        finally:
+            EVENT_SCAN_STATE["running"] = False
+
+    threading.Thread(target=worker, daemon=True).start()
+    return redirect(url_for("archive_events_scan_status"))
+
+
+@app.route("/archive/events/scan/status")
+def archive_events_scan_status():
+    if not EVENT_SCAN_STATE["running"] and EVENT_SCAN_STATE["stage"] == "done" and not EVENT_SCAN_STATE["error"]:
+        return redirect(url_for("archive_events_review"))
+
+    now = time.time()
+    stage_started_at = EVENT_SCAN_STATE.get("stage_started_at") or now
+    stage_elapsed = now - stage_started_at
+    done, total = EVENT_SCAN_STATE["done"], EVENT_SCAN_STATE["total"]
+    baseline = EVENT_SCAN_STATE.get("stage_baseline_done", 0)
+    progressed = max(done - baseline, 0)
+    eta = None
+    if progressed > 0 and total > done:
+        rate = stage_elapsed / progressed
+        eta = _fmt_duration(rate * (total - done))
+
+    return render_template_string(
+        STATUS_TEMPLATE, state=EVENT_SCAN_STATE, scan_root=EVENT_SCAN_STATE.get("root"),
+        elapsed=_fmt_duration(stage_elapsed), eta=eta,
+    )
+
+
+@app.route("/archive/events/review")
+def archive_events_review():
+    if EVENT_SCAN_STATE["running"]:
+        return redirect(url_for("archive_events_scan_status"))
+    scan_result = _load_event_scan_result()
+    if not scan_result:
+        return redirect(url_for("archive_browse"))
+
+    out_dir = Path(CONFIG["out_dir"])
+    ts_cache = {}
+    if (out_dir / "event_ts_cache.json").exists():
+        with open(out_dir / "event_ts_cache.json", encoding="utf-8") as f:
+            ts_cache = json.load(f)
+    thumb_cache = {}
+    if (out_dir / "event_thumb_cache.json").exists():
+        with open(out_dir / "event_thumb_cache.json", encoding="utf-8") as f:
+            thumb_cache = json.load(f)
+
+    files = []
+    for path in scan_result["images"]:
+        e = ts_cache.get(path)
+        if not e:
+            continue  # scan didn't finish caching this one -- shouldn't happen once "complete"
+        files.append({
+            "path": path, "name": path.rsplit("/", 1)[-1], "ts": e["ts"],
+            "thumb": thumb_cache.get(path) or "", "is_image": True,
+        })
+    for o in scan_result["others"]:
+        files.append({
+            "path": o["path"], "name": o["path"].rsplit("/", 1)[-1],
+            "ts": datetime.fromtimestamp(o["mtime"]).isoformat(), "thumb": "", "is_image": False,
+        })
+
+    files_json_str = json.dumps(files).replace("</", "<\\/")
+    html = EVENT_REVIEW_TEMPLATE.replace("__FILES_JSON__", files_json_str)
+    html = html.replace("__ARCHIVE_ROOT_JSON__", json.dumps(CONFIG["archive_root"]))
+    html = html.replace("__GAP_HOURS__", str(EVENT_GAP_SECONDS // 3600))
+    html = html.replace("__SCAN_ROOT__", str(escape(scan_result["root"])))
+    return html
+
+
+@app.route("/archive/events/confirm", methods=["POST"])
+def archive_events_confirm():
+    data = request.get_json(force=True, silent=True) or {}
+    events = [e for e in (data.get("events") or []) if e.get("paths")]
+    if not events:
+        return jsonify({"error": "No events to move."}), 400
+
+    try:
+        summaries = _sftp_call(lambda sftp: remote_client.move_grouped(
+            sftp, events, CONFIG["archive_root"],
+            min_age_seconds=CONFIG["archive_min_age_seconds"],
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    # Drop the scan result so a stale review page/back-button can't be
+    # resubmitted against files that have already moved.
+    try:
+        _event_scan_result_file().unlink()
+    except FileNotFoundError:
+        pass
+
+    return jsonify({"summaries": summaries})
 
 
 @app.route("/purge/browse")
