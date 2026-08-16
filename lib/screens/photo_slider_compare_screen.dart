@@ -182,6 +182,26 @@ class _PhotoSliderCompareScreenState extends State<PhotoSliderCompareScreen> {
                           scale: _zoomLevel,
                           pan: _panOffset,
                         ),
+                        // Right's BEST badge shares the base layer's
+                        // territory, so it's clipped to the inverse of the
+                        // left clip -- the region NOT covered by the left
+                        // layer -- rather than pinned to a fixed corner. As
+                        // the divider drags right and the left layer grows
+                        // over the top-right corner, this badge is clipped
+                        // away along with the right photo underneath it, so
+                        // it never claims "best" over what's now visibly
+                        // the left photo.
+                        if (widget.right.isBest)
+                          ClipRect(
+                            clipper: _InverseSliderClipper(_sliderPosition),
+                            child: const Align(
+                              alignment: Alignment.topRight,
+                              child: Padding(
+                                padding: EdgeInsets.only(top: 8, right: 8),
+                                child: _BestBadge(),
+                              ),
+                            ),
+                          ),
                         // Clipped layer: visible region grows from the
                         // screen's left edge as _sliderPosition increases,
                         // so dragging the divider right reveals more of
@@ -189,12 +209,27 @@ class _PhotoSliderCompareScreenState extends State<PhotoSliderCompareScreen> {
                         // OUTSIDE the zoomed content, so the divider
                         // boundary stays put on screen as you zoom -- only
                         // the photo pixels within each side get bigger.
+                        // Left's BEST badge lives inside this same clip
+                        // (mirroring right's badge above) so it disappears
+                        // together with the left photo once the divider
+                        // moves back past it.
                         ClipRect(
                           clipper: _SliderClipper(_sliderPosition),
-                          child: _PhotoLayer(
-                            fileFuture: _leftFileFuture,
-                            scale: _zoomLevel,
-                            pan: _panOffset,
+                          child: Stack(
+                            fit: StackFit.expand,
+                            children: [
+                              _PhotoLayer(
+                                fileFuture: _leftFileFuture,
+                                scale: _zoomLevel,
+                                pan: _panOffset,
+                              ),
+                              if (widget.left.isBest)
+                                const Positioned(
+                                  left: 8,
+                                  top: 8,
+                                  child: _BestBadge(),
+                                ),
+                            ],
                           ),
                         ),
                         Positioned(
@@ -309,6 +344,28 @@ class _SliderClipper extends CustomClipper<Rect> {
       oldClipper.position != position;
 }
 
+/// Complement of [_SliderClipper]: clips to the region right of the
+/// divider instead of left of it, so a widget using this clipper is
+/// visible exactly where [_SliderClipper] is NOT -- used to hide the
+/// right photo's BEST badge once the left layer grows over it.
+class _InverseSliderClipper extends CustomClipper<Rect> {
+  final double position;
+
+  _InverseSliderClipper(this.position);
+
+  @override
+  Rect getClip(Size size) => Rect.fromLTWH(
+        size.width * position,
+        0,
+        size.width * (1 - position),
+        size.height,
+      );
+
+  @override
+  bool shouldReclip(covariant _InverseSliderClipper oldClipper) =>
+      oldClipper.position != position;
+}
+
 class _PhotoLayer extends StatelessWidget {
   final Future<File?> fileFuture;
   final double scale;
@@ -382,6 +439,30 @@ class _PanButton extends StatelessWidget {
         onPressed: onPressed,
         constraints: const BoxConstraints(minWidth: 36, minHeight: 36),
         padding: EdgeInsets.zero,
+      ),
+    );
+  }
+}
+
+/// Same styling as `PhotoFullscreenViewer`'s inline "BEST" badge.
+class _BestBadge extends StatelessWidget {
+  const _BestBadge();
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: AppColors.accentBest,
+        borderRadius: BorderRadius.circular(4),
+      ),
+      child: const Text(
+        'BEST',
+        style: TextStyle(
+          color: AppColors.bgTop,
+          fontSize: 11,
+          fontWeight: FontWeight.bold,
+        ),
       ),
     );
   }
