@@ -225,7 +225,9 @@ remote machine — no server or new dependency is installed there, just the
   exists. ~19x faster against the real netbook.
 - `serve_review.py` — local Flask app, the single entry point
   (browse → scan → review → delete): `python3 serve_review.py --host 192.168.4.36 --out-dir ./run`,
-  then open `http://127.0.0.1:5000/`. Also hosts **archive mode**
+  then open `http://127.0.0.1:5036/` (binds `0.0.0.0` by default, so it's
+  also reachable from other devices on the LAN via this PC's IP — override
+  with `--http-host`/`--http-port`). Also hosts **archive mode**
   (`/archive/browse`, `/archive/confirm`, `POST /archive`) — relocates a
   folder from `--sync-root` (default `/media/backup/sync_data`) into
   `--archive-root` (default `/media/backup/archive`), same-disk and
@@ -283,15 +285,15 @@ python3 serve_review.py --host 192.168.4.36 --out-dir ./run
 # username, start-path, and key-filename all default (netbook / /media/backup /
 # the WSL SSH key) -- override with --username/--start-path/--key-filename/
 # --password if needed, or set DUPESWEEP_SSH_KEY to change the default key path
-# open http://127.0.0.1:5000/ -- browse -> scan -> review -> delete
+# open http://127.0.0.1:5036/ -- browse -> scan -> review -> delete
 # (delete moves the file into _to_delete on the netbook, never hard-deletes)
 
-# open http://127.0.0.1:5000/archive/browse for archive mode -- moves a
+# open http://127.0.0.1:5036/archive/browse for archive mode -- moves a
 # folder out of live sync (default /media/backup/sync_data) into a stable
 # archive folder (default /media/backup/archive) before you delete from
 # the phone; --sync-root/--archive-root override the defaults
 
-# open http://127.0.0.1:5000/purge/browse or /restore/browse to clean up
+# open http://127.0.0.1:5036/purge/browse or /restore/browse to clean up
 # _to_delete folders -- purge permanently removes them (irreversible),
 # restore moves them back to where they were deleted from
 ```

@@ -179,6 +179,12 @@ SFTP is kept for:
 - Python 3.9+ on this PC (the netbook itself needs nothing beyond the
   `sshd` it's already reachable through — no new dependency is installed
   on it).
+- **No authentication on this Flask server.** It binds `0.0.0.0` by default
+  (`--http-host`), so anyone on the same LAN who knows the port can browse,
+  scan, and — via purge/restore — permanently delete photos through it, no
+  login involved. That's the point (reach it from a phone/other PC on the
+  network), but only run this on a network you trust; use `--http-host
+  127.0.0.1` to go back to localhost-only if that's ever not the case.
 
 ## Setup
 
@@ -196,7 +202,9 @@ Interactive (recommended — browse, scan, review, delete all in one place):
 ```bash
 python3 serve_review.py --host 192.168.4.36 --out-dir ./run
 # username, start-path, and key-filename all default -- see Prerequisites
-# open http://127.0.0.1:5000/ in a browser
+# open http://127.0.0.1:5036/ in a browser -- binds 0.0.0.0 by default, so
+# it's also reachable from other devices on the LAN via this PC's IP
+# (override with --http-host/--http-port)
 ```
 
 `/browse` lets you navigate the netbook's folders one level at a time and
@@ -213,7 +221,7 @@ python3 scan_remote.py /media/backup/sync_data/Camera \
 # re-run the same command until it reports done (progress is cached)
 
 python3 serve_review.py --host 192.168.4.36 --out-dir ./run
-# open http://127.0.0.1:5000/ — scan is already done, goes straight to review
+# open http://127.0.0.1:5036/ — scan is already done, goes straight to review
 ```
 
 `--out-dir` must match between the two commands so `serve_review.py` finds
@@ -239,7 +247,7 @@ transferred). Once photos are there, it's safe to delete the phone-side
 originals.
 
 ```bash
-# open http://127.0.0.1:5000/archive/browse (also linked from the main
+# open http://127.0.0.1:5036/archive/browse (also linked from the main
 # review page and the regular /browse page)
 ```
 
@@ -336,7 +344,7 @@ same guarantee `python-mvp1` already has. Nothing purges those folders on
 its own; that's a deliberate, separate, opt-in step.
 
 ```bash
-# open http://127.0.0.1:5000/purge/browse or /restore/browse (also linked
+# open http://127.0.0.1:5036/purge/browse or /restore/browse (also linked
 # from the main review page, /browse, and /archive/browse)
 ```
 

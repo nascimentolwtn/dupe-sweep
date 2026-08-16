@@ -326,7 +326,8 @@ BROWSE_TEMPLATE = """<!doctype html>
 </style></head>
 <body>
 <header><h1>Browse netbook folders</h1>
-  <a class="nav-link" href="{{ url_for('archive_browse') }}">Archive mode &rarr;</a>
+  <a class="nav-link" href="{{ url_for('browse') }}">Dedup &rarr;</a>
+  <a class="nav-link" href="{{ url_for('archive_browse') }}">Archive &rarr;</a>
   <a class="nav-link" href="{{ url_for('purge_browse') }}">Purge/restore &rarr;</a>
 </header>
 <main>
@@ -397,7 +398,8 @@ ARCHIVE_BROWSE_TEMPLATE = """<!doctype html>
 </style></head>
 <body>
 <header><h1>Archive netbook folders</h1>
-  <a class="nav-link" href="{{ url_for('browse') }}">Dedup scan mode &rarr;</a>
+  <a class="nav-link" href="{{ url_for('browse') }}">Dedup &rarr;</a>
+  <a class="nav-link" href="{{ url_for('archive_browse') }}">Archive &rarr;</a>
   <a class="nav-link" href="{{ url_for('purge_browse') }}">Purge/restore &rarr;</a>
 </header>
 <main>
@@ -798,8 +800,10 @@ TRASH_BROWSE_TEMPLATE = """<!doctype html>
 <body>
 <header>
   <h1>{{ 'Purge' if mode == 'purge' else 'Restore' }} deleted photos</h1>
+  <a class="nav-link" href="{{ url_for('browse') }}">Dedup &rarr;</a>
+  <a class="nav-link" href="{{ url_for('archive_browse') }}">Archive &rarr;</a>
+  <a class="nav-link" href="{{ url_for('purge_browse') }}">Purge/restore &rarr;</a>
   <a class="nav-link" href="{{ url_for('restore_browse' if mode == 'purge' else 'purge_browse', path=path) }}">{{ 'Restore mode' if mode == 'purge' else 'Purge mode' }} &rarr;</a>
-  <a class="nav-link" href="{{ url_for('browse') }}">Dedup scan mode &rarr;</a>
 </header>
 <main>
   <div class="breadcrumb">{{ path }}</div>
@@ -1043,7 +1047,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     <button type="submit" class="secondary" __RESCAN_ATTRS__ title="Re-scan __SCAN_ROOT__ for new or changed photos">Re-scan</button>
   </form>
   <button id="delete-btn" class="danger">Delete marked</button>
-  <a href="/archive/browse" style="color:#93c5fd;font-size:13px;text-decoration:none;margin-left:auto">Archive mode &rarr;</a>
+  <a href="/" style="color:#93c5fd;font-size:13px;text-decoration:none;margin-left:auto">Dedup &rarr;</a>
+  <a href="/archive/browse" style="color:#93c5fd;font-size:13px;text-decoration:none">Archive &rarr;</a>
   <a href="/purge/browse" style="color:#93c5fd;font-size:13px;text-decoration:none">Purge/restore &rarr;</a>
 </header>
 <div class="lightbox" id="lightbox">
@@ -2091,7 +2096,10 @@ def main():
     ap.add_argument("--hash-distance", type=int, default=scan_remote.HASH_DISTANCE)
     ap.add_argument("--workers", type=int, default=4,
                      help="Thread pool size for scanning (default 4 -- keep low, see scan_remote.py docstring)")
-    ap.add_argument("--http-port", type=int, default=5000, help="Local port to serve on (default 5000)")
+    ap.add_argument("--http-host", type=str, default="0.0.0.0",
+                     help="Interface to bind the local Flask server to (default 0.0.0.0, "
+                          "i.e. reachable from other devices on the LAN, not just this PC)")
+    ap.add_argument("--http-port", type=int, default=5036, help="Local port to serve on (default 5036)")
     ap.add_argument("--sync-root", type=str, default="/media/backup/sync_data",
                      help="Live-synced root that archive mode's /archive/browse is rooted at "
                           "(default /media/backup/sync_data)")
@@ -2114,8 +2122,12 @@ def main():
     })
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
 
-    print(f"Serving on http://127.0.0.1:{args.http_port}/ (Ctrl+C to stop)")
-    app.run(host="127.0.0.1", port=args.http_port, threaded=True)
+    if args.http_host == "0.0.0.0":
+        print(f"Serving on http://127.0.0.1:{args.http_port}/ (also reachable from other "
+              f"devices on the LAN via this PC's IP) (Ctrl+C to stop)")
+    else:
+        print(f"Serving on http://{args.http_host}:{args.http_port}/ (Ctrl+C to stop)")
+    app.run(host=args.http_host, port=args.http_port, threaded=True)
 
 
 if __name__ == "__main__":
