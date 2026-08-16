@@ -11,6 +11,7 @@ in python-mvp1/find_duplicate_photos.py and apply_delete_list.py, adapted
 for SFTP (which has no os.walk equivalent).
 """
 
+import re
 import shlex
 import stat
 import time
@@ -284,12 +285,14 @@ def move_tree(sftp, src_root, dst_root, min_age_seconds=300, date_from=None, dat
 
 
 def _sanitize_event_name(name):
-    """Folder-name-safe version of a user-edited event name: strips
-    surrounding whitespace/slashes and collapses embedded slashes so it
-    can't escape dest_root or create unintended subfolders."""
-    name = name.strip().strip("/")
-    name = name.replace("/", "_")
-    return name or "Untitled"
+    """Folder-name-safe version of a user-edited event name: splits on any
+    path separator and drops empty/"."/".." segments entirely (not just
+    replaces slashes -- a bare ".." has no slash to collapse but still
+    resolves to dest_root's parent, so it must be dropped, not renamed) so
+    the result can't escape dest_root or create unintended subfolders."""
+    parts = re.split(r"[/\\]+", name.strip())
+    parts = [p for p in parts if p not in ("", ".", "..")]
+    return "_".join(parts) or "Untitled"
 
 
 def move_grouped(sftp, events, dest_root, min_age_seconds=300):

@@ -304,6 +304,30 @@ def _save_event_scan_result(data):
         json.dump(data, f)
 
 
+def _prune_event_scan_result(moved_paths):
+    """Drop `moved_paths` from the persisted scan result after a confirm
+    (whether a single per-event confirm or the bulk one), removing the file
+    entirely once nothing scanned remains unconfirmed. This is what keeps
+    /archive/events/confirm's scope check (below) working across multiple
+    per-event confirms in one session -- the old behavior of unlinking the
+    whole result file after ANY confirm call would reject every subsequent
+    per-event confirm with "no active scan" the moment the first one
+    succeeded."""
+    scan_result = _load_event_scan_result()
+    if not scan_result:
+        return
+    moved = set(moved_paths)
+    scan_result["images"] = [p for p in scan_result["images"] if p not in moved]
+    scan_result["others"] = [o for o in scan_result["others"] if o["path"] not in moved]
+    if scan_result["images"] or scan_result["others"]:
+        _save_event_scan_result(scan_result)
+    else:
+        try:
+            _event_scan_result_file().unlink()
+        except FileNotFoundError:
+            pass
+
+
 # In-process memo for event_ts_cache.json/event_thumb_cache.json, keyed by
 # each file's mtime: the review page now lazy-loads thumbnails one at a
 # time via /archive/events/thumb instead of inlining all of them (see
@@ -1996,9 +2020,21 @@ def review():
 def delete():
     body = request.get_json(force=True) or {}
     paths = body.get("paths", [])
+
+    # The review page only ever sends paths it built from hash_cache.json
+    # scoped to scan_root, but this endpoint takes the path list straight
+    # from the request body -- without this check, any LAN client that can
+    # reach this unauthenticated, 0.0.0.0-bound server could move-to-trash
+    # an arbitrary absolute path, not just a photo this tool surfaced.
+    scan_root = _load_scan_root()
+    root_prefix = f"{scan_root.rstrip('/')}/" if scan_root else None
+
     deleted = _load_deleted_paths()
     results = {}
     for p in paths:
+        if not root_prefix or not p.startswith(root_prefix):
+            results[p] = False
+            continue
         try:
             _sftp_call(lambda sftp: remote_client.move_to_trash(sftp, p))
             deleted.add(p)
@@ -2260,6 +2296,18 @@ def archive_events_confirm():
     if not events:
         return jsonify({"error": "No events to move."}), 400
 
+    # Only allow moving paths this tool itself surfaced in the last event
+    # scan -- without this, any LAN client that can reach this
+    # unauthenticated, 0.0.0.0-bound endpoint could rename an arbitrary
+    # absolute path on the remote host by crafting the request body
+    # directly, not just a photo the scan found.
+    scan_result = _load_event_scan_result()
+    known_paths = set(scan_result["images"]) | {o["path"] for o in scan_result["others"]} if scan_result else set()
+    submitted = [p for e in events for p in e["paths"]]
+    unknown = [p for p in submitted if p not in known_paths]
+    if unknown:
+        return jsonify({"error": f"Refusing to move paths outside the last scan: {unknown[:3]}"}), 400
+
     try:
         summaries = _sftp_call(lambda sftp: remote_client.move_grouped(
             sftp, events, CONFIG["archive_root"],
@@ -2268,12 +2316,10 @@ def archive_events_confirm():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-    # Drop the scan result so a stale review page/back-button can't be
-    # resubmitted against files that have already moved.
-    try:
-        _event_scan_result_file().unlink()
-    except FileNotFoundError:
-        pass
+    # Drop the moved paths from the persisted scan result (see
+    # _prune_event_scan_result) so a stale review page/back-button -- or a
+    # replayed request -- can't move them again.
+    _prune_event_scan_result(submitted)
 
     return jsonify({"summaries": summaries})
 
