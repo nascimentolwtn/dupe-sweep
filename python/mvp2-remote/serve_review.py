@@ -10,13 +10,19 @@ directly from the page instead of exporting a CSV for a separate
 apply_delete_list.py run later like python-mvp1 does.
 
 Routes:
-  GET  /browse         folder-picker UI rooted at --start-path
-  POST /scan            kicks off scan_remote.run_scan() on a background
-                         thread for the chosen path
-  GET  /scan/status      auto-refreshing progress page, redirects to / when done
-  GET  /                review UI built from the caches in --out-dir
-  POST /delete           {paths: [...]} -> move-to-_to_delete over SFTP
-  GET  /raw?path=        full-res bytes for the lightbox
+  GET  /browse            folder-picker UI rooted at --start-path
+  POST /scan               kicks off scan_remote.run_scan() on a background
+                            thread for the chosen path
+  GET  /scan/status         auto-refreshing progress page, redirects to / when done
+  GET  /                    review UI built from the caches in --out-dir
+  POST /delete              {paths: [...]} -> move-to-_to_delete over SFTP
+  GET  /raw?path=           full-res bytes for the lightbox
+  GET  /archive/browse      folder-picker UI rooted at --sync-root, for
+                            picking a folder to move out of live sync
+  GET  /archive/confirm     preview: file/byte count for the chosen folder
+                            (+ optional date_from/date_to) before moving
+  POST /archive             moves the confirmed folder from --sync-root
+                            into --archive-root via remote_client.move_tree()
 
 Usage:
     python3 serve_review.py --host 192.168.4.36 --out-dir ./run
@@ -30,7 +36,7 @@ import json
 import os
 import posixpath
 import threading
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import imagehash
@@ -111,8 +117,10 @@ BROWSE_TEMPLATE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Browse netbook folders</title>
 <style>
   body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #f4f5f7; color: #1d1f24; }
-  header { background: #1d1f24; color: #fff; padding: 14px 20px; }
+  header { background: #1d1f24; color: #fff; padding: 14px 20px; display: flex; align-items: center; gap: 16px; }
   header h1 { font-size: 16px; margin: 0; }
+  header a.nav-link { color: #93c5fd; font-size: 13px; text-decoration: none; margin-left: auto; }
+  header a.nav-link:hover { text-decoration: underline; }
   main { padding: 20px; max-width: 800px; margin: 0 auto; }
   .breadcrumb { font-size: 13px; color: #666; margin-bottom: 16px; word-break: break-all; }
   ul { list-style: none; padding: 0; }
@@ -126,7 +134,7 @@ BROWSE_TEMPLATE = """<!doctype html>
   .error { color: #ef4444; margin-bottom: 16px; }
 </style></head>
 <body>
-<header><h1>Browse netbook folders</h1></header>
+<header><h1>Browse netbook folders</h1><a class="nav-link" href="{{ url_for('archive_browse') }}">Archive mode &rarr;</a></header>
 <main>
   <div class="breadcrumb">{{ path }}</div>
   {% if error %}<div class="error">Could not list this folder: {{ error }}</div>{% endif %}
@@ -160,6 +168,129 @@ STATUS_TEMPLATE = """<!doctype html>
   <div class="count">{{ state.done }}/{{ state.total }}</div>
   {% if state.error %}<div class="error">Error: {{ state.error }}</div>{% endif %}
 </div></body></html>
+"""
+
+# Archive-move mode: a same-disk relocation from the live-synced --sync-root
+# into a stable --archive-root, so it's safe to delete the phone-side
+# original afterwards without racing the sync client. Reuses list_subdirs
+# for the folder picker (same pattern as BROWSE_TEMPLATE above), rooted at
+# --sync-root instead of --start-path.
+ARCHIVE_BROWSE_TEMPLATE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Archive netbook folders</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #f4f5f7; color: #1d1f24; }
+  header { background: #1d1f24; color: #fff; padding: 14px 20px; display: flex; align-items: center; gap: 16px; }
+  header h1 { font-size: 16px; margin: 0; }
+  header a.nav-link { color: #93c5fd; font-size: 13px; text-decoration: none; margin-left: auto; }
+  header a.nav-link:hover { text-decoration: underline; }
+  main { padding: 20px; max-width: 800px; margin: 0 auto; }
+  .breadcrumb { font-size: 13px; color: #666; margin-bottom: 16px; word-break: break-all; }
+  ul { list-style: none; padding: 0; }
+  li { margin-bottom: 6px; }
+  a { color: #3b82f6; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .scan-btn { margin-top: 20px; }
+  .scan-btn button { background: #3b82f6; color: #fff; border: none; padding: 10px 16px;
+                      border-radius: 6px; font-size: 14px; cursor: pointer; }
+  .scan-btn button:hover { filter: brightness(1.1); }
+  .error { color: #ef4444; margin-bottom: 16px; }
+</style></head>
+<body>
+<header><h1>Archive netbook folders</h1><a class="nav-link" href="{{ url_for('browse') }}">Dedup scan mode &rarr;</a></header>
+<main>
+  <div class="breadcrumb">{{ path }}</div>
+  <p style="font-size:13px;color:#666">Moving a folder here relocates it (same-disk, instant) from
+    <code>{{ sync_root }}</code> into <code>{{ archive_root }}</code>, out of the way of the live sync
+    client, so it's safe to delete the phone-side originals afterwards.</p>
+  {% if error %}<div class="error">Could not list this folder: {{ error }}</div>{% endif %}
+  <ul>
+    {% if can_go_up %}<li><a href="{{ url_for('archive_browse', path=parent) }}">.. (up)</a></li>{% endif %}
+    {% for d in subdirs %}
+      <li><a href="{{ url_for('archive_browse', path=(path.rstrip('/') + '/' + d)) }}">{{ d }}/</a></li>
+    {% endfor %}
+  </ul>
+  <form class="scan-btn" method="get" action="{{ url_for('archive_confirm') }}">
+    <input type="hidden" name="path" value="{{ path }}">
+    <button type="submit">Archive this folder (and all subfolders)</button>
+  </form>
+</main>
+</body></html>
+"""
+
+ARCHIVE_CONFIRM_TEMPLATE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Confirm archive</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #f4f5f7; color: #1d1f24; }
+  header { background: #1d1f24; color: #fff; padding: 14px 20px; }
+  header h1 { font-size: 16px; margin: 0; }
+  main { padding: 20px; max-width: 800px; margin: 0 auto; }
+  code { background: #e5e7eb; padding: 2px 5px; border-radius: 4px; }
+  label { display: block; margin: 10px 0 4px; font-size: 13px; }
+  input[type=date] { padding: 6px 8px; border-radius: 6px; border: 1px solid #ccc; }
+  button { border: none; padding: 10px 16px; border-radius: 6px; font-size: 14px; cursor: pointer; margin-top: 16px; margin-right: 10px; }
+  button.secondary { background: #444a55; color: #fff; }
+  button.danger { background: #dc2626; color: #fff; }
+  button:hover { filter: brightness(1.1); }
+  .error { color: #ef4444; margin-bottom: 16px; }
+  .back { display: inline-block; margin-top: 20px; font-size: 13px; color: #3b82f6; text-decoration: none; }
+  .back:hover { text-decoration: underline; }
+</style></head>
+<body>
+<header><h1>Confirm archive</h1></header>
+<main>
+  <p>Source: <code>{{ path }}</code></p>
+  {% if error %}<div class="error">{{ error }}</div>{% else %}
+  <p><strong>{{ count }}</strong> file(s), <strong>{{ "%.1f"|format(total_bytes / (1024*1024)) }} MB</strong>
+     found{% if date_from or date_to %} in the selected date range{% endif %}.</p>
+  {% endif %}
+  <p>Destination: <code>{{ archive_root }}</code> (mirrors the same subfolder structure). Files
+     modified in the last few minutes are skipped automatically (still-syncing guard).</p>
+  <form method="get" action="{{ url_for('archive_confirm') }}">
+    <input type="hidden" name="path" value="{{ path }}">
+    <label>From date (optional): <input type="date" name="date_from" value="{{ date_from }}"></label>
+    <label>To date (optional): <input type="date" name="date_to" value="{{ date_to }}"></label>
+    <button type="submit" class="secondary">Update count for this date range</button>
+    <button type="submit" formaction="{{ url_for('do_archive') }}" formmethod="post" class="danger">Confirm: move these files to archive</button>
+  </form>
+  <a class="back" href="{{ url_for('archive_browse', path=path) }}">&larr; back to browse</a>
+</main>
+</body></html>
+"""
+
+ARCHIVE_RESULT_TEMPLATE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Archive result</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #f4f5f7; color: #1d1f24; }
+  header { background: #1d1f24; color: #fff; padding: 14px 20px; }
+  header h1 { font-size: 16px; margin: 0; }
+  main { padding: 20px; max-width: 800px; margin: 0 auto; }
+  code { background: #e5e7eb; padding: 2px 5px; border-radius: 4px; }
+  .error { color: #ef4444; margin-bottom: 16px; }
+  .ok { color: #16a34a; font-weight: 600; }
+  .back { display: inline-block; margin-top: 20px; font-size: 13px; color: #3b82f6; text-decoration: none; }
+  .back:hover { text-decoration: underline; }
+</style></head>
+<body>
+<header><h1>Archive result</h1></header>
+<main>
+  {% if error %}
+  <div class="error">Archive failed: {{ error }}</div>
+  {% else %}
+  <p>Moved <strong>{{ summary.moved }}</strong> file(s)
+     (<strong>{{ "%.1f"|format(summary.moved_bytes / (1024*1024)) }} MB</strong>) from
+     <code>{{ path }}</code> to <code>{{ dest }}</code>.</p>
+  <p>Skipped (modified too recently, possibly still syncing): {{ summary.skipped_recent }}</p>
+  <p>Renamed due to a name collision at the destination: {{ summary.skipped_collision_renamed }}</p>
+  {% if summary.errors %}
+  <div class="error">{{ summary.errors|length }} error(s):<br>
+  {% for p, e in summary.errors %}{{ p }}: {{ e }}<br>{% endfor %}
+  </div>
+  {% endif %}
+  <p class="ok">These files are now safe to delete from the phone.</p>
+  {% endif %}
+  <a class="back" href="{{ url_for('archive_browse') }}">&larr; back to archive browse</a>
+</main>
+</body></html>
 """
 
 # Adapted from python-mvp1/build_review_html.py's HTML_TEMPLATE: the CSV
@@ -234,6 +365,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <button id="load-progress-btn" class="secondary">Load progress</button>
   <input type="file" id="load-progress-input" accept="application/json" style="display:none">
   <button id="delete-btn" class="danger">Delete marked</button>
+  <a href="/archive/browse" style="color:#93c5fd;font-size:13px;text-decoration:none;margin-left:auto">Archive mode &rarr;</a>
 </header>
 <div class="lightbox" id="lightbox">
   <div class="lb-bar">
@@ -675,6 +807,101 @@ def raw():
     return Response(data, mimetype=mimetype)
 
 
+def _parse_date_range(date_from_str, date_to_str):
+    """Parse optional YYYY-MM-DD strings (as produced by <input type=date>)
+    into unix timestamps for filtering by file mtime. date_to is treated as
+    inclusive of the whole day. Returns (from_ts, to_ts, error_message)."""
+    from_ts = to_ts = None
+    try:
+        if date_from_str:
+            from_ts = datetime.strptime(date_from_str, "%Y-%m-%d").timestamp()
+        if date_to_str:
+            to_ts = (datetime.strptime(date_to_str, "%Y-%m-%d") + timedelta(days=1)).timestamp()
+    except ValueError:
+        return None, None, "Invalid date format (expected YYYY-MM-DD)."
+    return from_ts, to_ts, None
+
+
+@app.route("/archive/browse")
+def archive_browse():
+    path = request.args.get("path", CONFIG["sync_root"])
+    path = posixpath.normpath(path)
+    try:
+        subdirs = _sftp_call(lambda sftp: remote_client.list_subdirs(sftp, path))
+        error = None
+    except Exception as e:
+        subdirs = []
+        error = str(e)
+    parent = posixpath.dirname(path.rstrip("/")) or "/"
+    # Keep the picker inside the sync tree -- archiving only makes sense
+    # relative to --sync-root, so don't offer an "up" past it.
+    can_go_up = path != CONFIG["sync_root"] and path.startswith(CONFIG["sync_root"])
+    return render_template_string(
+        ARCHIVE_BROWSE_TEMPLATE, path=path, subdirs=subdirs, parent=parent, error=error,
+        can_go_up=can_go_up, sync_root=CONFIG["sync_root"], archive_root=CONFIG["archive_root"],
+    )
+
+
+@app.route("/archive/confirm")
+def archive_confirm():
+    path = request.args.get("path")
+    if not path:
+        abort(400)
+    date_from_str = request.args.get("date_from", "")
+    date_to_str = request.args.get("date_to", "")
+    date_from_ts, date_to_ts, date_error = _parse_date_range(date_from_str, date_to_str)
+
+    count, total_bytes, error = 0, 0, date_error
+    if not date_error:
+        try:
+            def _count(sftp):
+                c, b = 0, 0
+                for info in remote_client.list_files(sftp, path):
+                    if date_from_ts is not None and info["mtime"] < date_from_ts:
+                        continue
+                    if date_to_ts is not None and info["mtime"] > date_to_ts:
+                        continue
+                    c += 1
+                    b += info["size"]
+                return c, b
+            count, total_bytes = _sftp_call(_count)
+        except Exception as e:
+            error = str(e)
+
+    return render_template_string(
+        ARCHIVE_CONFIRM_TEMPLATE, path=path, count=count, total_bytes=total_bytes,
+        date_from=date_from_str, date_to=date_to_str, error=error,
+        archive_root=CONFIG["archive_root"],
+    )
+
+
+@app.route("/archive", methods=["POST"])
+def do_archive():
+    path = request.form.get("path")
+    if not path:
+        abort(400)
+    date_from_str = request.form.get("date_from", "")
+    date_to_str = request.form.get("date_to", "")
+    date_from_ts, date_to_ts, date_error = _parse_date_range(date_from_str, date_to_str)
+
+    sync_root = CONFIG["sync_root"]
+    rel = path[len(sync_root):].lstrip("/") if path.startswith(sync_root) else Path(path).name
+    dest_root = f"{CONFIG['archive_root']}/{rel}" if rel else CONFIG["archive_root"]
+
+    summary, error = None, date_error
+    if not date_error:
+        try:
+            summary = _sftp_call(lambda sftp: remote_client.move_tree(
+                sftp, path, dest_root,
+                min_age_seconds=CONFIG["archive_min_age_seconds"],
+                date_from=date_from_ts, date_to=date_to_ts,
+            ))
+        except Exception as e:
+            error = str(e)
+
+    return render_template_string(ARCHIVE_RESULT_TEMPLATE, path=path, dest=dest_root, summary=summary, error=error)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--host", type=str, required=True, help="Netbook hostname/IP")
@@ -694,6 +921,15 @@ def main():
     ap.add_argument("--workers", type=int, default=4,
                      help="Thread pool size for scanning (default 4 -- keep low, see scan_remote.py docstring)")
     ap.add_argument("--http-port", type=int, default=5000, help="Local port to serve on (default 5000)")
+    ap.add_argument("--sync-root", type=str, default="/media/backup/sync_data",
+                     help="Live-synced root that archive mode's /archive/browse is rooted at "
+                          "(default /media/backup/sync_data)")
+    ap.add_argument("--archive-root", type=str, default="/media/backup/archive",
+                     help="Stable, sync-untouched destination for archive mode "
+                          "(default /media/backup/archive)")
+    ap.add_argument("--archive-min-age-seconds", type=float, default=300,
+                     help="Skip archiving files modified more recently than this "
+                          "(still-syncing guard, default 300)")
     args = ap.parse_args()
 
     CONFIG.update({
@@ -702,6 +938,8 @@ def main():
         "out_dir": args.out_dir, "start_path": args.start_path,
         "time_window": args.time_window, "hash_distance": args.hash_distance,
         "workers": args.workers,
+        "sync_root": args.sync_root, "archive_root": args.archive_root,
+        "archive_min_age_seconds": args.archive_min_age_seconds,
     })
     Path(args.out_dir).mkdir(parents=True, exist_ok=True)
 

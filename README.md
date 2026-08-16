@@ -115,8 +115,15 @@ SSH — for example an old backup box too weak to hash/score thousands of
 photos itself. Point it at a folder on that machine, review duplicate
 groups in a browser (thumbnails, sharpness/exposure scoring, "best" pick),
 and delete straight from the page — the file is only ever moved into a
-`_to_delete` folder, never hard-deleted. See
-`python/mvp2-remote/README_MVP2.md` for setup and usage, and
+`_to_delete` folder, never hard-deleted.
+
+It also has an **archive mode**, for when that machine's photo folder is a
+live two-way sync target (e.g. Syncthing from the phone): it relocates a
+chosen folder into a separate, sync-untouched archive folder first (same
+disk, instant), so it's safe to delete the phone-side originals afterwards
+without the sync tool racing the cleanup.
+
+See `python/mvp2-remote/README_MVP2.md` for setup and usage, and
 `python/mvp1/README_MVP1.md` for the original local-only variant this was
 built from.
 

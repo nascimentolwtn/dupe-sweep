@@ -12,6 +12,7 @@ for SFTP (which has no os.walk equivalent).
 """
 
 import stat
+import time
 from pathlib import PurePosixPath
 
 import paramiko
@@ -47,12 +48,13 @@ def list_subdirs(sftp, path):
     return sorted(dirs)
 
 
-def list_images(sftp, root):
-    """Recursive walk mirroring python-mvp1's list_images(): listdir_attr()
-    + stat.S_ISDIR() recursion since paramiko has no os.walk equivalent.
-    Yields a dict per image file with the size/mtime already captured from
-    the listing (avoids a second stat() round-trip per file later). Skips
-    _to_delete staging folders and hidden/trashed/temp files."""
+def _walk_entries(sftp, root):
+    """Shared recursive walk: listdir_attr() + stat.S_ISDIR() recursion
+    since paramiko has no os.walk equivalent. Yields (full_path,
+    SFTPAttributes) for every *file* under `root` (directories are
+    traversed, not yielded), skipping _to_delete staging folders — those
+    are pending-deletion output from the dedup feature, never a candidate
+    for scanning or archiving."""
     root = str(root)
     stack = [root]
     while stack:
@@ -69,11 +71,29 @@ def list_images(sftp, root):
                     continue
                 stack.append(full)
             else:
-                if name.startswith(EXCLUDE_PREFIXES):
-                    continue
-                ext = PurePosixPath(name).suffix.lower()
-                if ext in IMAGE_EXTS:
-                    yield {"path": full, "size": entry.st_size, "mtime": entry.st_mtime}
+                yield full, entry
+
+
+def list_images(sftp, root):
+    """Recursive walk mirroring python-mvp1's list_images(). Yields a dict
+    per image file with the size/mtime already captured from the listing
+    (avoids a second stat() round-trip per file later). Skips hidden/
+    trashed/temp files (see _walk_entries for the _to_delete folder skip)."""
+    for full, entry in _walk_entries(sftp, root):
+        name = full.rsplit("/", 1)[-1]
+        if name.startswith(EXCLUDE_PREFIXES):
+            continue
+        ext = PurePosixPath(name).suffix.lower()
+        if ext in IMAGE_EXTS:
+            yield {"path": full, "size": entry.st_size, "mtime": entry.st_mtime}
+
+
+def list_files(sftp, root):
+    """Recursive walk yielding every file (any extension, no exclude-prefix
+    filtering) under `root` — used by archive-move, which relocates whole
+    folder trees rather than cherry-picking photos."""
+    for full, entry in _walk_entries(sftp, root):
+        yield {"path": full, "size": entry.st_size, "mtime": entry.st_mtime}
 
 
 def read_bytes(sftp, remote_path):
@@ -125,3 +145,76 @@ def move_to_trash(sftp, remote_path):
     dest = _resolve_collision(sftp, f"{trash_dir}/{name}")
     sftp.rename(remote_path, dest)
     return dest
+
+
+def _ensure_dir(sftp, path):
+    """mkdir -p equivalent over SFTP: create `path` and any missing
+    parents. No-op if it already exists."""
+    if not path or path == "/":
+        return
+    if _exists(sftp, path):
+        return
+    parent = path.rsplit("/", 1)[0]
+    if parent and parent != path:
+        _ensure_dir(sftp, parent)
+    try:
+        sftp.mkdir(path)
+    except IOError:
+        pass  # created concurrently -- fine either way
+
+
+def move_tree(sftp, src_root, dst_root, min_age_seconds=300, date_from=None, date_to=None):
+    """Recursive same-disk move: relocates every file under src_root to the
+    same relative path under dst_root via sftp.rename() — instant, no bytes
+    transferred, since both live on the netbook's own disk. Used to move
+    photos out of a live-synced folder into a stable archive before it's
+    safe to delete them from the phone.
+
+    Skips files modified within the last `min_age_seconds` (default 300s)
+    as a guard against moving a file the sync client is still writing.
+    `date_from`/`date_to` (unix timestamps, optional) further narrow the
+    walk by file mtime. Never deletes — only relocates, with the same
+    `_1`/`_2` collision-suffix safety as move_to_trash(). Returns a summary
+    dict: moved count/bytes, skipped-recent count, skipped-collision-
+    renamed count, errors."""
+    src_root = str(src_root).rstrip("/")
+    dst_root = str(dst_root).rstrip("/")
+    now = time.time()
+
+    moved = 0
+    moved_bytes = 0
+    skipped_recent = 0
+    skipped_collision_renamed = 0
+    errors = []
+
+    for info in list_files(sftp, src_root):
+        path = info["path"]
+        mtime = info["mtime"]
+        if date_from is not None and mtime < date_from:
+            continue
+        if date_to is not None and mtime > date_to:
+            continue
+        if now - mtime < min_age_seconds:
+            skipped_recent += 1
+            continue
+
+        rel = path[len(src_root):].lstrip("/")
+        dest = f"{dst_root}/{rel}"
+        try:
+            _ensure_dir(sftp, dest.rsplit("/", 1)[0])
+            final_dest = _resolve_collision(sftp, dest)
+            if final_dest != dest:
+                skipped_collision_renamed += 1
+            sftp.rename(path, final_dest)
+            moved += 1
+            moved_bytes += info["size"]
+        except Exception as e:
+            errors.append((path, str(e)))
+
+    return {
+        "moved": moved,
+        "moved_bytes": moved_bytes,
+        "skipped_recent": skipped_recent,
+        "skipped_collision_renamed": skipped_collision_renamed,
+        "errors": errors,
+    }

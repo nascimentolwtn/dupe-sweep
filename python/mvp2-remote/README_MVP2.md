@@ -24,10 +24,12 @@ the Dart app).
 ## What's here
 
 - `remote_client.py` — paramiko SSH/SFTP helper: connect, a non-recursive
-  `list_subdirs()` (folder picker), a recursive `list_images()` walk
-  (paramiko has no `os.walk`), `read_bytes()` (prefetched, for fast full-file
-  reads over SSH), and `move_to_trash()` (move-not-delete, with a `_1`/`_2`
-  collision suffix instead of overwriting).
+  `list_subdirs()` (folder picker), recursive walks (`list_images()` for
+  photos only, `list_files()` for every file), `read_bytes()` (prefetched,
+  for fast full-file reads over SSH), `move_to_trash()` (move-not-delete,
+  with a `_1`/`_2` collision suffix instead of overwriting), and
+  `move_tree()` (recursive same-disk relocation for archive mode, see
+  below).
 - `scan_remote.py` — the heavy lifting: hashes + EXIF-timestamps every image
   found (`hash_cache.json`), clusters by time proximity then visual
   similarity, then scores sharpness/exposure (`score_cache.json`) and
@@ -36,8 +38,10 @@ the Dart app).
   imported (`run_scan(...)`) by `serve_review.py`.
 - `serve_review.py` — local Flask app (runs on this PC, not the netbook):
   browse the netbook's folders, kick off a scan, review duplicate groups
-  with embedded thumbnails, and delete straight from the page. Delete goes
-  over SSH to the netbook immediately (no CSV/apply-step round trip).
+  with embedded thumbnails, and delete straight from the page (delete goes
+  over SSH to the netbook immediately, no CSV/apply-step round trip); also
+  hosts archive mode (`/archive/browse`, `/archive/confirm`, `POST
+  /archive`) — see below.
 - `requirements.txt` — `pillow`, `imagehash`, `numpy`, `paramiko`, `flask`.
 
 ## Prerequisites
@@ -102,9 +106,52 @@ etc.), deleting moves files into a `_to_delete` folder *inside* that
 synced tree — the sync tool can (and did, once, in the local case) clean
 up folders it doesn't recognize as part of the mirror. If the netbook's
 backed-up-photos folder is a live sync target, don't run a real delete
-pass there until you've confirmed `_to_delete` won't get swept — see
-`.claude/plans/archive-remote-photos.md` for a planned mode that moves
-photos into a stable, sync-untouched sibling folder first.
+pass there until you've moved the photos out of it first — see Archive
+mode below.
+
+## Archive mode: move photos out of live sync before deleting
+
+Solves the constraint above: relocates a chosen folder from a live-synced
+tree (`--sync-root`, default `/media/backup/sync_data`) into a stable
+folder the sync tool never touches (`--archive-root`, default
+`/media/backup/archive`), same-disk (`sftp.rename`, instant, no bytes
+transferred). Once photos are there, it's safe to delete the phone-side
+originals.
+
+```bash
+# open http://127.0.0.1:5000/archive/browse (also linked from the main
+# review page and the regular /browse page)
+```
+
+1. **`/archive/browse`** — same folder-picker as `/browse`, rooted at
+   `--sync-root` instead of `--start-path`.
+2. **`/archive/confirm`** — before moving anything: shows a file/byte count
+   for the chosen folder (optionally narrowed by an from/to date range,
+   filtered by file mtime — no EXIF parsing, keeps this feature
+   Pillow-free). Has an "Update count" button to re-preview after changing
+   dates, separate from "Confirm: move these files".
+3. **`POST /archive`** — moves the confirmed folder (preserving its
+   subfolder structure) into `--archive-root`, skipping:
+   - anything inside a `_to_delete` folder (pending-deletion output from
+     the dedup feature, never an archive candidate),
+   - anything modified more recently than `--archive-min-age-seconds`
+     (default 300) — a guard against moving a file the sync client is
+     still writing,
+   - and renaming (`_1`/`_2` suffix, same as `move_to_trash()`) instead of
+     overwriting on a destination name collision.
+
+   Returns a summary: files moved, bytes moved, skipped-as-recent count,
+   renamed-for-collision count, and any per-file errors.
+
+**Operational note from verifying this against the real netbook:**
+`/media/backup` here is an NTFS-3g (`fuseblk`) mount with
+`user_id=0,group_id=0` — every file appears owned by root regardless of
+who created it, so a non-root SSH user cannot backdate/change mtimes
+(`touch`/`utime` both fail with `EPERM`) even though the permission bits
+allow read/write/rename freely. This doesn't affect normal operation
+(archive mode only *reads* mtimes, never sets them), but it's worth
+knowing if you ever need to construct test fixtures with specific
+timestamps against this netbook.
 
 ## Concurrency
 
