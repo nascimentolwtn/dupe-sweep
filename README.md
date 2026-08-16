@@ -1,5 +1,7 @@
 # DupeSweep
 
+**Version: 1.4.7**
+
 A lightweight Android app for finding and reviewing duplicate photos on your phone. Designed for personal use only (no analytics, ads, or cloud upload).
 
 ## Build & Run

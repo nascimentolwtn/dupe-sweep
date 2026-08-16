@@ -13,7 +13,6 @@ import '../services/photo_scanner_service.dart';
 import '../services/scan_cache_service.dart';
 import '../services/similarity_service.dart';
 import '../theme/app_theme.dart';
-import '../utils/byte_formatter.dart';
 import '../widgets/gradient_button.dart';
 import 'duplicate_review_screen.dart';
 import 'flagged_photo_review_screen.dart';
@@ -343,22 +342,7 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
         _stopTiming();
         Navigator.of(context).pushReplacement(
           MaterialPageRoute(
-            builder: (_) => FlaggedPhotoReviewScreen(
-              mode: ScanMode.blurry,
-              photosSelector: (p) => p.blurryPhotos,
-              subtitleBuilder: (photo) {
-                final sharpness =
-                    ((photo.sharpnessScore ?? 0) * 100).toStringAsFixed(0);
-                final exposure = photo.exposureScore;
-                // exposureScore is only populated by the newer scan code
-                // path -- omit the clause entirely for photos scored before
-                // this field existed rather than showing a misleading 0%.
-                if (exposure == null) return 'Sharpness: $sharpness%';
-                return 'Sharpness: $sharpness% · Exposure: '
-                    '${(exposure * 100).toStringAsFixed(0)}%';
-              },
-              emptyMessage: 'No blurry photos found.',
-            ),
+            builder: (_) => FlaggedPhotoReviewScreen.forMode(ScanMode.blurry),
           ),
         );
       }
@@ -417,13 +401,8 @@ class _ScanProgressScreenState extends State<ScanProgressScreen> {
         _stopTiming();
         Navigator.of(context).pushReplacement(
           MaterialPageRoute(
-            builder: (_) => FlaggedPhotoReviewScreen(
-              mode: ScanMode.largeFiles,
-              photosSelector: (p) => p.largeFiles,
-              subtitleBuilder: (photo) => ByteFormatter.format(photo.fileSize),
-              emptyMessage: 'No large files found (nothing over '
-                  '${LargeFileScanService.kMinFileSizeBytes ~/ (1024 * 1024)}MB).',
-            ),
+            builder: (_) =>
+                FlaggedPhotoReviewScreen.forMode(ScanMode.largeFiles),
           ),
         );
       }

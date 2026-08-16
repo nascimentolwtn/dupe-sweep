@@ -13,7 +13,7 @@ import '../utils/byte_formatter.dart';
 /// delete the rest" comparison here -- each row stands on its own, so a
 /// flat list with a per-row checkbox is the right shape instead of
 /// `PhotoGroupCard`'s grouped-comparison UI.
-class FlaggedPhotoList extends StatelessWidget {
+class FlaggedPhotoList extends StatefulWidget {
   final List<PhotoItem> photos;
   final String Function(PhotoItem photo) subtitleBuilder;
   final VoidCallback onSelectionChanged;
@@ -26,25 +26,63 @@ class FlaggedPhotoList extends StatelessWidget {
   });
 
   @override
+  State<FlaggedPhotoList> createState() => _FlaggedPhotoListState();
+}
+
+class _FlaggedPhotoListState extends State<FlaggedPhotoList> {
+  // Explicit controller (rather than relying on ListView's implicit
+  // PrimaryScrollController) so Scrollbar below can attach to it --
+  // Android/iOS don't draw a scrollbar by default the way desktop/web do,
+  // so without this there was no visible or grabbable scroll handle on a
+  // list that can run into the hundreds of flagged photos.
+  final ScrollController _scrollController = ScrollController();
+
+  @override
+  void dispose() {
+    _scrollController.dispose();
+    super.dispose();
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return ListView.builder(
-      padding: const EdgeInsets.only(bottom: 96),
-      itemCount: photos.length,
-      itemBuilder: (context, index) {
-        return _FlaggedPhotoRow(
-          // Keyed by photo id, not index -- same reasoning as
-          // PhotoGroupCard's thumbnail row: without this, deleting a row
-          // can make Flutter reuse another row's State (and its already-
-          // fetched thumbnail future) for a different photo that shifted
-          // into its old index.
-          key: ValueKey(photos[index].id),
-          photo: photos[index],
-          allPhotos: photos,
-          index: index,
-          subtitle: subtitleBuilder(photos[index]),
-          onSelectionChanged: onSelectionChanged,
-        );
-      },
+    // RawScrollbar (not the plain Material Scrollbar) so minThumbLength can
+    // be forced -- this list can run into the hundreds of flagged photos,
+    // and the default proportional thumb shrinks to a barely-grabbable
+    // sliver on a list that long. trackVisibility mirrors
+    // DuplicateReviewScreen's Scrollbar, which the same complaint didn't
+    // apply to.
+    return RawScrollbar(
+      controller: _scrollController,
+      thumbVisibility: true,
+      trackVisibility: true,
+      interactive: true,
+      thickness: 10,
+      minThumbLength: 64,
+      radius: const Radius.circular(6),
+      thumbColor: AppColors.accentCyan,
+      trackColor: AppColors.surfaceElevated,
+      trackBorderColor: AppColors.border,
+      child: ListView.builder(
+        controller: _scrollController,
+        padding: const EdgeInsets.only(bottom: 96),
+        itemCount: widget.photos.length,
+        itemBuilder: (context, index) {
+          return _FlaggedPhotoRow(
+            // Keyed by photo id, not index -- same reasoning as
+            // PhotoGroupCard's thumbnail row: without this, deleting a row
+            // can make Flutter reuse another row's State (and its already-
+            // fetched thumbnail future) for a different photo that shifted
+            // into its old index.
+            key: ValueKey(widget.photos[index].id),
+            photo: widget.photos[index],
+            allPhotos: widget.photos,
+            index: index,
+            subtitle: widget.subtitleBuilder(widget.photos[index]),
+            subtitleBuilder: widget.subtitleBuilder,
+            onSelectionChanged: widget.onSelectionChanged,
+          );
+        },
+      ),
     );
   }
 }
@@ -54,6 +92,7 @@ class _FlaggedPhotoRow extends StatefulWidget {
   final List<PhotoItem> allPhotos;
   final int index;
   final String subtitle;
+  final String Function(PhotoItem photo) subtitleBuilder;
   final VoidCallback onSelectionChanged;
 
   const _FlaggedPhotoRow({
@@ -62,6 +101,7 @@ class _FlaggedPhotoRow extends StatefulWidget {
     required this.allPhotos,
     required this.index,
     required this.subtitle,
+    required this.subtitleBuilder,
     required this.onSelectionChanged,
   });
 
@@ -101,6 +141,7 @@ class _FlaggedPhotoRowState extends State<_FlaggedPhotoRow> {
         builder: (_) => PhotoFullscreenViewer(
           photos: widget.allPhotos,
           initialIndex: widget.index,
+          labelBuilder: widget.subtitleBuilder,
         ),
       ),
     );

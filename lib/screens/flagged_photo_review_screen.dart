@@ -3,7 +3,9 @@ import 'package:provider/provider.dart';
 import '../main.dart';
 import '../models/photo_item.dart';
 import '../models/scan_mode.dart';
+import '../services/large_file_scan_service.dart';
 import '../theme/app_theme.dart';
+import '../utils/byte_formatter.dart';
 import '../widgets/flagged_photo_list.dart';
 import 'scan_progress_screen.dart';
 
@@ -29,6 +31,46 @@ class FlaggedPhotoReviewScreen extends StatelessWidget {
     required this.emptyMessage,
   });
 
+  /// The mode-specific config (which list, subtitle text, empty-state
+  /// copy) used to be duplicated between `ScanProgressScreen` (built after
+  /// a fresh scan finishes) and `HomeScreen` (built when resuming a saved
+  /// list, skipping the scan entirely) -- factored here so both routes to
+  /// this screen stay in sync automatically.
+  factory FlaggedPhotoReviewScreen.forMode(ScanMode mode) {
+    switch (mode) {
+      case ScanMode.blurry:
+        return FlaggedPhotoReviewScreen(
+          mode: ScanMode.blurry,
+          photosSelector: (p) => p.blurryPhotos,
+          subtitleBuilder: (photo) {
+            final sharpness =
+                ((photo.sharpnessScore ?? 0) * 100).toStringAsFixed(0);
+            final exposure = photo.exposureScore;
+            // exposureScore is only populated by the newer scan code
+            // path -- omit the clause entirely for photos scored before
+            // this field existed rather than showing a misleading 0%.
+            if (exposure == null) return 'Sharpness: $sharpness%';
+            return 'Sharpness: $sharpness% · Exposure: '
+                '${(exposure * 100).toStringAsFixed(0)}%';
+          },
+          emptyMessage: 'No blurry photos found.',
+        );
+      case ScanMode.largeFiles:
+        return FlaggedPhotoReviewScreen(
+          mode: ScanMode.largeFiles,
+          photosSelector: (p) => p.largeFiles,
+          subtitleBuilder: (photo) => ByteFormatter.format(photo.fileSize),
+          emptyMessage: 'No large files found (nothing over '
+              '${LargeFileScanService.kMinFileSizeBytes ~/ (1024 * 1024)}MB).',
+        );
+      case ScanMode.duplicates:
+        throw ArgumentError(
+          'FlaggedPhotoReviewScreen has no config for ScanMode.duplicates '
+          '-- use DuplicateReviewScreen instead.',
+        );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Consumer<AppStateProvider>(
@@ -36,7 +78,13 @@ class FlaggedPhotoReviewScreen extends StatelessWidget {
         final photos = photosSelector(provider);
 
         return Scaffold(
-          appBar: AppBar(title: Text(mode.menuLabel)),
+          appBar: AppBar(
+            title: Text(
+              photos.isEmpty
+                  ? mode.menuLabel
+                  : '${mode.menuLabel} (${photos.length})',
+            ),
+          ),
           body: photos.isEmpty
               ? Center(
                   child: Padding(
@@ -58,8 +106,9 @@ class FlaggedPhotoReviewScreen extends StatelessWidget {
               ? null
               : FlaggedPhotoSummaryBar(
                   photos: photos,
-                  onDeleted: () =>
-                      context.read<AppStateProvider>().refreshSelection(),
+                  onDeleted: () => context
+                      .read<AppStateProvider>()
+                      .refreshFlaggedSelection(mode),
                   onRescan: () => Navigator.of(context).pushReplacement(
                     MaterialPageRoute(
                       builder: (_) => ScanProgressScreen(mode: mode),

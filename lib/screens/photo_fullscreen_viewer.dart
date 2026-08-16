@@ -20,11 +20,16 @@ import '../theme/app_theme.dart';
 class PhotoFullscreenViewer extends StatefulWidget {
   final List<PhotoItem> photos;
   final int initialIndex;
+  // Optional per-photo overlay text (e.g. "Sharpness: 4% · Exposure: 92%"
+  // for the blurry-photo review flow) -- null for flows with nothing
+  // useful to show here, like duplicate-group comparison.
+  final String Function(PhotoItem photo)? labelBuilder;
 
   const PhotoFullscreenViewer({
     super.key,
     required this.photos,
     required this.initialIndex,
+    this.labelBuilder,
   });
 
   @override
@@ -249,6 +254,32 @@ class _PhotoFullscreenViewerState extends State<PhotoFullscreenViewer> {
                     child: _RoundIconButton(
                       icon: Icons.chevron_right,
                       onPressed: () => _goTo(_currentIndex + 1),
+                    ),
+                  ),
+                ),
+
+              // Score overlay (sharpness/exposure, etc.) -- sits just above
+              // the mark-for-deletion bar so it stays legible over any part
+              // of the photo underneath it.
+              if (widget.labelBuilder != null)
+                Positioned(
+                  left: 0,
+                  right: 0,
+                  bottom: 72,
+                  child: Center(
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 6,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.black54,
+                        borderRadius: BorderRadius.circular(16),
+                      ),
+                      child: Text(
+                        widget.labelBuilder!(photo),
+                        style: const TextStyle(color: Colors.white),
+                      ),
                     ),
                   ),
                 ),

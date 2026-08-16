@@ -5,6 +5,17 @@ import '../models/photo_item.dart';
 class ScoringService {
   /// Compute sharpness score using Laplacian variance on a thumbnail.
   /// Returns a score between 0 and 1, where 1 is sharpest.
+  ///
+  /// Computed as the MAX variance across a grid of tiles, not one variance
+  /// over the whole frame. A single whole-image variance gets diluted by
+  /// any large flat region (sky, wall, blown highlights, smooth skin) even
+  /// when the actual subject is in sharp focus elsewhere in the same
+  /// photo -- that flat-vs-focus confound was landing genuinely sharp
+  /// photos in the same near-zero range as truly blurry ones. Taking the
+  /// sharpest tile fixes that asymmetrically: a photo blurry everywhere
+  /// still scores low (no tile has real edge content), while a sharp
+  /// subject against a flat background is no longer dragged down by the
+  /// background.
   static double computeSharpness(Uint8List imageBytes) {
     try {
       final image = img.decodeImage(imageBytes);
@@ -14,34 +25,55 @@ class ScoringService {
       final resized = img.copyResize(image, width: 200, height: 200);
       final gray = img.grayscale(resized);
 
-      // Apply simple Laplacian kernel and compute variance
-      double sumLaplacian = 0.0;
-      double sumSquared = 0.0;
-      int pixelCount = 0;
+      const tilesPerSide = 5;
+      final tileW = gray.width ~/ tilesPerSide;
+      final tileH = gray.height ~/ tilesPerSide;
+      double maxVariance = 0.0;
 
-      for (int y = 1; y < gray.height - 1; y++) {
-        for (int x = 1; x < gray.width - 1; x++) {
-          final center = _getGrayValue(gray.getPixelSafe(x, y));
-          final north = _getGrayValue(gray.getPixelSafe(x, y - 1));
-          final south = _getGrayValue(gray.getPixelSafe(x, y + 1));
-          final east = _getGrayValue(gray.getPixelSafe(x + 1, y));
-          final west = _getGrayValue(gray.getPixelSafe(x - 1, y));
+      for (int ty = 0; ty < tilesPerSide; ty++) {
+        for (int tx = 0; tx < tilesPerSide; tx++) {
+          // Stay 1px inside the tile (and the image) on every edge so the
+          // Laplacian's 4-neighbor sample never reads outside gray's
+          // bounds.
+          final x0 = (tx * tileW).clamp(1, gray.width - 2);
+          final y0 = (ty * tileH).clamp(1, gray.height - 2);
+          final x1 = (tx == tilesPerSide - 1)
+              ? gray.width - 1
+              : ((tx + 1) * tileW).clamp(1, gray.width - 1);
+          final y1 = (ty == tilesPerSide - 1)
+              ? gray.height - 1
+              : ((ty + 1) * tileH).clamp(1, gray.height - 1);
 
-          // Laplacian operator
-          final laplacian = 4 * center - north - south - east - west;
-          sumLaplacian += laplacian;
-          sumSquared += laplacian * laplacian;
-          pixelCount++;
+          double sumLaplacian = 0.0;
+          double sumSquared = 0.0;
+          int pixelCount = 0;
+
+          for (int y = y0; y < y1; y++) {
+            for (int x = x0; x < x1; x++) {
+              final center = _getGrayValue(gray.getPixelSafe(x, y));
+              final north = _getGrayValue(gray.getPixelSafe(x, y - 1));
+              final south = _getGrayValue(gray.getPixelSafe(x, y + 1));
+              final east = _getGrayValue(gray.getPixelSafe(x + 1, y));
+              final west = _getGrayValue(gray.getPixelSafe(x - 1, y));
+
+              // Laplacian operator
+              final laplacian = 4 * center - north - south - east - west;
+              sumLaplacian += laplacian;
+              sumSquared += laplacian * laplacian;
+              pixelCount++;
+            }
+          }
+
+          if (pixelCount == 0) continue;
+
+          final mean = sumLaplacian / pixelCount;
+          final variance = (sumSquared / pixelCount) - (mean * mean);
+          if (variance > maxVariance) maxVariance = variance;
         }
       }
 
-      if (pixelCount == 0) return 0.0;
-
-      final mean = sumLaplacian / pixelCount;
-      final variance = (sumSquared / pixelCount) - (mean * mean);
-
       // Normalize variance to 0-1 range
-      final normalizedVariance = variance / 100000.0;
+      final normalizedVariance = maxVariance / 100000.0;
       return (normalizedVariance > 1.0) ? 1.0 : normalizedVariance;
     } catch (e) {
       debugPrint('Error computing sharpness: $e');

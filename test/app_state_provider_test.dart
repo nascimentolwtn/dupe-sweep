@@ -4,6 +4,8 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:dupesweep/main.dart';
 import 'package:dupesweep/models/photo_group.dart';
 import 'package:dupesweep/models/photo_item.dart';
+import 'package:dupesweep/models/scan_mode.dart';
+import 'package:dupesweep/services/flagged_photo_cache_service.dart';
 import 'package:dupesweep/services/review_cache_service.dart';
 
 PhotoItem _photo(String id, {int fileSize = 1000, bool isBest = false}) =>
@@ -418,6 +420,120 @@ void main() {
       provider.loadSavedReview([]);
 
       expect(notified, isTrue);
+    });
+  });
+
+  group('AppStateProvider flagged-photo-cache persistence', () {
+    late Directory tempDir;
+
+    setUp(() {
+      tempDir =
+          Directory.systemTemp.createTempSync('app_state_flagged_test_');
+    });
+
+    tearDown(() {
+      if (tempDir.existsSync()) {
+        tempDir.deleteSync(recursive: true);
+      }
+    });
+
+    test('finishBlurScan persists the blurry list for a later launch to '
+        'resume', () async {
+      final blurryCache = FlaggedPhotoCacheService.blurry(directory: tempDir);
+      final provider = AppStateProvider(blurryCache: blurryCache);
+
+      provider.finishBlurScan([_photo('a'), _photo('b')]);
+      // finishBlurScan fires the save off without awaiting it (see
+      // main.dart) -- await the debug-only hook so the background write
+      // has actually landed on disk before asserting against it.
+      await provider.debugLastBlurrySave;
+
+      final reloaded =
+          await FlaggedPhotoCacheService.blurry(directory: tempDir).load();
+      expect(reloaded, isNotNull);
+      expect(reloaded!.map((p) => p.id), ['a', 'b']);
+    });
+
+    test('finishLargeFileScan persists the large-file list for a later '
+        'launch to resume', () async {
+      final largeFilesCache =
+          FlaggedPhotoCacheService.largeFiles(directory: tempDir);
+      final provider = AppStateProvider(largeFilesCache: largeFilesCache);
+
+      provider.finishLargeFileScan([_photo('a'), _photo('b')]);
+      await provider.debugLastLargeFilesSave;
+
+      final reloaded = await FlaggedPhotoCacheService.largeFiles(
+        directory: tempDir,
+      ).load();
+      expect(reloaded, isNotNull);
+      expect(reloaded!.map((p) => p.id), ['a', 'b']);
+    });
+
+    test(
+        'refreshFlaggedSelection(blurry) re-saves the blurry list so a '
+        'later launch never resumes into already-deleted photos', () async {
+      final blurryCache = FlaggedPhotoCacheService.blurry(directory: tempDir);
+      final provider = AppStateProvider(blurryCache: blurryCache);
+      provider.blurryPhotos = [_photo('a'), _photo('b')];
+
+      provider.blurryPhotos.removeWhere((p) => p.id == 'b');
+      provider.refreshFlaggedSelection(ScanMode.blurry);
+      await provider.debugLastBlurrySave;
+
+      final reloaded =
+          await FlaggedPhotoCacheService.blurry(directory: tempDir).load();
+      expect(reloaded!.map((p) => p.id), ['a']);
+    });
+
+    test(
+        'refreshFlaggedSelection(largeFiles) re-saves the large-file list '
+        'so a later launch never resumes into already-deleted photos',
+        () async {
+      final largeFilesCache =
+          FlaggedPhotoCacheService.largeFiles(directory: tempDir);
+      final provider = AppStateProvider(largeFilesCache: largeFilesCache);
+      provider.largeFiles = [_photo('a'), _photo('b')];
+
+      provider.largeFiles.removeWhere((p) => p.id == 'a');
+      provider.refreshFlaggedSelection(ScanMode.largeFiles);
+      await provider.debugLastLargeFilesSave;
+
+      final reloaded = await FlaggedPhotoCacheService.largeFiles(
+        directory: tempDir,
+      ).load();
+      expect(reloaded!.map((p) => p.id), ['b']);
+    });
+
+    test('refreshFlaggedSelection(duplicates) is a no-op cache-wise but '
+        'still notifies listeners', () {
+      final provider = AppStateProvider();
+      var notified = false;
+      provider.addListener(() => notified = true);
+
+      provider.refreshFlaggedSelection(ScanMode.duplicates);
+
+      expect(notified, isTrue);
+    });
+
+    test('loadSavedBlurryPhotos sets blurryPhotos and clears isScanning', () {
+      final provider = AppStateProvider();
+      provider.isScanning = true;
+
+      provider.loadSavedBlurryPhotos([_photo('a')]);
+
+      expect(provider.blurryPhotos.map((p) => p.id), ['a']);
+      expect(provider.isScanning, isFalse);
+    });
+
+    test('loadSavedLargeFiles sets largeFiles and clears isScanning', () {
+      final provider = AppStateProvider();
+      provider.isScanning = true;
+
+      provider.loadSavedLargeFiles([_photo('a')]);
+
+      expect(provider.largeFiles.map((p) => p.id), ['a']);
+      expect(provider.isScanning, isFalse);
     });
   });
 }

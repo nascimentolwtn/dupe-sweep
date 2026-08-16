@@ -2,7 +2,9 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 import 'models/photo_group.dart';
 import 'models/photo_item.dart';
+import 'models/scan_mode.dart';
 import 'screens/permission_screen.dart';
+import 'services/flagged_photo_cache_service.dart';
 import 'services/review_cache_service.dart';
 import 'theme/app_theme.dart';
 
@@ -32,9 +34,17 @@ class AppStateProvider extends ChangeNotifier {
   // Injectable for testability (mirrors ScanCacheService's pattern); defaults
   // to the real on-disk service in production.
   final ReviewCacheService _reviewCache;
+  final FlaggedPhotoCacheService _blurryCache;
+  final FlaggedPhotoCacheService _largeFilesCache;
 
-  AppStateProvider({ReviewCacheService? reviewCache})
-      : _reviewCache = reviewCache ?? ReviewCacheService();
+  AppStateProvider({
+    ReviewCacheService? reviewCache,
+    FlaggedPhotoCacheService? blurryCache,
+    FlaggedPhotoCacheService? largeFilesCache,
+  })  : _reviewCache = reviewCache ?? ReviewCacheService(),
+        _blurryCache = blurryCache ?? FlaggedPhotoCacheService.blurry(),
+        _largeFilesCache =
+            largeFilesCache ?? FlaggedPhotoCacheService.largeFiles();
 
   /// The most recently kicked-off review-list save, if any. Production
   /// callers never await this -- a save failure isn't worth blocking or
@@ -47,6 +57,14 @@ class AppStateProvider extends ChangeNotifier {
   @visibleForTesting
   Future<void>? debugLastReviewSave;
 
+  // Same fire-and-forget/test-visibility pattern as [debugLastReviewSave],
+  // for the flat blurry/large-file lists' own cache files.
+  @visibleForTesting
+  Future<void>? debugLastBlurrySave;
+
+  @visibleForTesting
+  Future<void>? debugLastLargeFilesSave;
+
   List<PhotoGroup> photoGroups = [];
   bool isScanning = false;
   double scanProgress = 0.0;
@@ -55,25 +73,63 @@ class AppStateProvider extends ChangeNotifier {
   // Flat, independently-flagged results for the large-file finder (napkin
   // backlog #8) -- deliberately NOT PhotoGroups: there's no "keep the best,
   // delete the rest" comparison for these, each photo/video is judged on
-  // its own. Not persisted via ReviewCacheService like photoGroups -- these
-  // scans are cheap enough (metadata-only, see LargeFileScanService) that
-  // resuming across app restarts isn't worth the added complexity.
+  // its own. Persisted via [_largeFilesCache], same resume-on-restart
+  // purpose as [photoGroups]/[_reviewCache].
   List<PhotoItem> largeFiles = [];
 
   void finishLargeFileScan(List<PhotoItem> photos) {
     largeFiles = photos;
     isScanning = false;
+    // Fire-and-forget: a save failure just means next launch falls back to
+    // a full rescan, not something worth blocking/erroring the UI over.
+    debugLastLargeFilesSave = _largeFilesCache.save(largeFiles);
     notifyListeners();
   }
 
   // Flat, independently-flagged results for the blurry-photo detector
   // (napkin backlog #8) -- same "no best-photo comparison" shape as
-  // [largeFiles], and likewise not persisted across restarts.
+  // [largeFiles], and likewise persisted via [_blurryCache].
   List<PhotoItem> blurryPhotos = [];
 
   void finishBlurScan(List<PhotoItem> photos) {
     blurryPhotos = photos;
     isScanning = false;
+    debugLastBlurrySave = _blurryCache.save(blurryPhotos);
+    notifyListeners();
+  }
+
+  /// Restores a previously-saved blurry-photo list (see
+  /// [FlaggedPhotoCacheService.blurry]) so `HomeScreen`'s "Find Blurry
+  /// Photos" button can skip straight to reviewing instead of forcing a
+  /// rescan -- mirrors [loadSavedReview] for the duplicate-scan flow.
+  void loadSavedBlurryPhotos(List<PhotoItem> photos) {
+    blurryPhotos = photos;
+    isScanning = false;
+    notifyListeners();
+  }
+
+  /// Same as [loadSavedBlurryPhotos], for the large-file finder.
+  void loadSavedLargeFiles(List<PhotoItem> photos) {
+    largeFiles = photos;
+    isScanning = false;
+    notifyListeners();
+  }
+
+  /// Same purpose as [refreshSelection] but for the flat blurry/large-file
+  /// lists: also re-persists the (already in-place-mutated, see
+  /// `FlaggedPhotoSummaryBar._performDeletion`) list to disk so a later
+  /// resume never re-shows an already-deleted photo. Doesn't share code
+  /// with [removeDeletedPhotos] -- that method also prunes/re-elects a
+  /// "best" photo per group, a concept these flat lists don't have.
+  void refreshFlaggedSelection(ScanMode mode) {
+    switch (mode) {
+      case ScanMode.blurry:
+        debugLastBlurrySave = _blurryCache.save(blurryPhotos);
+      case ScanMode.largeFiles:
+        debugLastLargeFilesSave = _largeFilesCache.save(largeFiles);
+      case ScanMode.duplicates:
+        break;
+    }
     notifyListeners();
   }
 

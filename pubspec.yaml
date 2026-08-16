@@ -2,7 +2,7 @@ name: dupesweep
 description: A personal Android app to find and review duplicate photos on your device.
 publish_to: 'none'
 
-version: 1.0.0+1
+version: 1.4.7+1
 
 environment:
   sdk: '>=3.0.0 <4.0.0'

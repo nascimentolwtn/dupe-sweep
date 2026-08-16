@@ -1,11 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:provider/provider.dart';
-import '../main.dart';
-import '../services/review_cache_service.dart';
 import '../theme/app_theme.dart';
 import '../widgets/gradient_button.dart';
-import 'duplicate_review_screen.dart';
 import 'home_screen.dart';
 
 class PermissionScreen extends StatefulWidget {
@@ -41,30 +37,20 @@ class _PermissionScreenState extends State<PermissionScreen> {
     }
   }
 
-  /// Routes to the review screen directly if a saved review list exists
-  /// (see `ReviewCacheService`/`AppStateProvider.loadSavedReview`) so the
-  /// user isn't forced through a full rescan when nothing's changed since
-  /// last time; otherwise falls back to the normal scan flow. A "Re-scan"
-  /// button is always available from the review screen if a fresh scan is
-  /// wanted instead.
+  /// Always lands on the mode-select menu, even when a saved review exists
+  /// -- restarting the app used to jump straight back into
+  /// `DuplicateReviewScreen`, which meant there was no way to reach the
+  /// blurry/large-file modes (or start a fresh dupe scan) without first
+  /// backing out of a review you may not have wanted to resume into.
+  /// `HomeScreen`'s "Find Duplicates" button is what now checks for a saved
+  /// review and offers to resume it -- see its `_startDuplicatesFlow`.
   Future<void> _navigateAfterPermissionGranted() async {
-    final savedGroups = await ReviewCacheService().load();
     if (!mounted) return;
-
-    if (savedGroups != null) {
-      context.read<AppStateProvider>().loadSavedReview(savedGroups);
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(
-          builder: (_) => const DuplicateReviewScreen(),
-        ),
-      );
-    } else {
-      Navigator.of(context).pushReplacement(
-        MaterialPageRoute(
-          builder: (_) => const HomeScreen(),
-        ),
-      );
-    }
+    Navigator.of(context).pushReplacement(
+      MaterialPageRoute(
+        builder: (_) => const HomeScreen(),
+      ),
+    );
   }
 
   Future<void> _requestPermission() async {
