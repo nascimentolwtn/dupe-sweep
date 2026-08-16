@@ -54,6 +54,7 @@ Dependencies: flask, paramiko, pillow, imagehash, numpy (pip install -r requirem
 """
 
 import argparse
+import base64
 import json
 import os
 import posixpath
@@ -303,26 +304,58 @@ def _save_event_scan_result(data):
         json.dump(data, f)
 
 
+# In-process memo for event_ts_cache.json/event_thumb_cache.json, keyed by
+# each file's mtime: the review page now lazy-loads thumbnails one at a
+# time via /archive/events/thumb instead of inlining all of them (see
+# archive_events_thumb below), so re-parsing the whole (possibly large,
+# base64-laden) cache file from disk on every single image request would
+# just trade one big cost for thousands of smaller repeated ones. Reloads
+# automatically once the file's mtime changes (e.g. after a rescan).
+_EVENT_CACHE_MEMO = {}
+
+
+def _load_event_cache(name):
+    path = Path(CONFIG["out_dir"]) / name
+    if not path.exists():
+        return {}
+    mtime = path.stat().st_mtime
+    cached = _EVENT_CACHE_MEMO.get(name)
+    if cached is None or cached[0] != mtime:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        _EVENT_CACHE_MEMO[name] = (mtime, data)
+        return data
+    return cached[1]
+
+
 BROWSE_TEMPLATE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>Browse netbook folders</title>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Browse netbook folders</title>
 <style>
+  * { box-sizing: border-box; }
   body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #f4f5f7; color: #1d1f24; }
-  header { background: #1d1f24; color: #fff; padding: 14px 20px; display: flex; align-items: center; gap: 16px; }
+  header { background: #1d1f24; color: #fff; padding: 14px 20px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
   header h1 { font-size: 16px; margin: 0; }
-  header a.nav-link { color: #93c5fd; font-size: 13px; text-decoration: none; }
+  header a.nav-link { color: #93c5fd; font-size: 13px; text-decoration: none; padding: 4px 0; }
   header a.nav-link:first-of-type { margin-left: auto; }
   header a.nav-link:hover { text-decoration: underline; }
   main { padding: 20px; max-width: 800px; margin: 0 auto; }
   .breadcrumb { font-size: 13px; color: #666; margin-bottom: 16px; word-break: break-all; }
   ul { list-style: none; padding: 0; }
-  li { margin-bottom: 6px; }
-  a { color: #3b82f6; text-decoration: none; }
+  li { margin-bottom: 4px; }
+  a { color: #3b82f6; text-decoration: none; display: inline-block; padding: 8px 4px; }
   a:hover { text-decoration: underline; }
   .scan-btn { margin-bottom: 20px; }
-  .scan-btn button { background: #3b82f6; color: #fff; border: none; padding: 10px 16px;
-                      border-radius: 6px; font-size: 14px; cursor: pointer; }
+  .scan-btn button { background: #3b82f6; color: #fff; border: none; padding: 12px 18px;
+                      border-radius: 6px; font-size: 15px; cursor: pointer; width: 100%; max-width: 420px; }
   .scan-btn button:hover { filter: brightness(1.1); }
   .error { color: #ef4444; margin-bottom: 16px; }
+  @media (max-width: 640px) {
+    header { padding: 10px 14px; }
+    header a.nav-link:first-of-type { margin-left: 0; }
+    main { padding: 14px; }
+  }
 </style></head>
 <body>
 <header><h1>Browse netbook folders</h1>
@@ -349,10 +382,12 @@ BROWSE_TEMPLATE = """<!doctype html>
 
 STATUS_TEMPLATE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta http-equiv="refresh" content="2">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Scanning...</title>
 <style>
+  * { box-sizing: border-box; }
   body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; background: #1d1f24; color: #fff;
-         display: flex; align-items: center; justify-content: center; height: 100vh; margin: 0; }
+         display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; padding: 20px; }
   .box { text-align: center; }
   .path { font-size: 13px; color: #aaa; margin-bottom: 14px; max-width: 80vw; word-break: break-all;
           font-family: ui-monospace, Consolas, monospace; }
@@ -376,25 +411,33 @@ STATUS_TEMPLATE = """<!doctype html>
 # for the folder picker (same pattern as BROWSE_TEMPLATE above), rooted at
 # --sync-root instead of --start-path.
 ARCHIVE_BROWSE_TEMPLATE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>Archive netbook folders</title>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Archive netbook folders</title>
 <style>
+  * { box-sizing: border-box; }
   body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #f4f5f7; color: #1d1f24; }
-  header { background: #1d1f24; color: #fff; padding: 14px 20px; display: flex; align-items: center; gap: 16px; }
+  header { background: #1d1f24; color: #fff; padding: 14px 20px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
   header h1 { font-size: 16px; margin: 0; }
-  header a.nav-link { color: #93c5fd; font-size: 13px; text-decoration: none; }
+  header a.nav-link { color: #93c5fd; font-size: 13px; text-decoration: none; padding: 4px 0; }
   header a.nav-link:first-of-type { margin-left: auto; }
   header a.nav-link:hover { text-decoration: underline; }
   main { padding: 20px; max-width: 800px; margin: 0 auto; }
   .breadcrumb { font-size: 13px; color: #666; margin-bottom: 16px; word-break: break-all; }
   ul { list-style: none; padding: 0; }
-  li { margin-bottom: 6px; }
-  a { color: #3b82f6; text-decoration: none; }
+  li { margin-bottom: 4px; }
+  a { color: #3b82f6; text-decoration: none; display: inline-block; padding: 8px 4px; }
   a:hover { text-decoration: underline; }
   .scan-btn { margin-bottom: 20px; }
-  .scan-btn button { background: #3b82f6; color: #fff; border: none; padding: 10px 16px;
-                      border-radius: 6px; font-size: 14px; cursor: pointer; }
+  .scan-btn button { background: #3b82f6; color: #fff; border: none; padding: 12px 18px;
+                      border-radius: 6px; font-size: 15px; cursor: pointer; width: 100%; max-width: 420px; }
   .scan-btn button:hover { filter: brightness(1.1); }
   .error { color: #ef4444; margin-bottom: 16px; }
+  @media (max-width: 640px) {
+    header { padding: 10px 14px; }
+    header a.nav-link:first-of-type { margin-left: 0; }
+    main { padding: 14px; }
+  }
 </style></head>
 <body>
 <header><h1>Archive netbook folders</h1>
@@ -423,22 +466,29 @@ ARCHIVE_BROWSE_TEMPLATE = """<!doctype html>
 """
 
 ARCHIVE_CONFIRM_TEMPLATE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>Confirm archive</title>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Confirm archive</title>
 <style>
+  * { box-sizing: border-box; }
   body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #f4f5f7; color: #1d1f24; }
   header { background: #1d1f24; color: #fff; padding: 14px 20px; }
   header h1 { font-size: 16px; margin: 0; }
   main { padding: 20px; max-width: 800px; margin: 0 auto; }
-  code { background: #e5e7eb; padding: 2px 5px; border-radius: 4px; }
+  code { background: #e5e7eb; padding: 2px 5px; border-radius: 4px; word-break: break-all; }
   label { display: block; margin: 10px 0 4px; font-size: 13px; }
-  input[type=date] { padding: 6px 8px; border-radius: 6px; border: 1px solid #ccc; }
-  button { border: none; padding: 10px 16px; border-radius: 6px; font-size: 14px; cursor: pointer; margin-top: 16px; margin-right: 10px; }
+  input[type=date] { padding: 8px; border-radius: 6px; border: 1px solid #ccc; font-size: 15px; width: 100%; max-width: 240px; }
+  button { border: none; padding: 12px 18px; border-radius: 6px; font-size: 14px; cursor: pointer; margin-top: 10px; margin-right: 10px; }
   button.secondary { background: #444a55; color: #fff; }
   button.danger { background: #dc2626; color: #fff; }
   button:hover { filter: brightness(1.1); }
   .error { color: #ef4444; margin-bottom: 16px; }
   .back { display: inline-block; margin-top: 20px; font-size: 13px; color: #3b82f6; text-decoration: none; }
   .back:hover { text-decoration: underline; }
+  @media (max-width: 640px) {
+    main { padding: 14px; }
+    form button { display: block; width: 100%; margin: 8px 0 0; }
+  }
 </style></head>
 <body>
 <header><h1>Confirm archive</h1></header>
@@ -461,24 +511,31 @@ ARCHIVE_CONFIRM_TEMPLATE = """<!doctype html>
   </form>
   <p style="font-size:12px;color:#666;margin-top:10px">"Group into events" is for a flat, undated dump of
     photos (like a raw sync folder) -- it splits them into per-occasion albums with a thumbnail review
-    before moving. If this folder is already one coherent event, just confirm the move directly above.</p>
+    before moving. If this folder is already one coherent event, just confirm the move directly above.
+    It ignores the date range above (which filters by file mtime) and always looks at the whole folder,
+    clustering by each photo's real capture time instead -- narrow to specific events using the review
+    page's own controls afterward.</p>
   <a class="back" href="{{ url_for('archive_browse', path=path) }}">&larr; back to browse</a>
 </main>
 </body></html>
 """
 
 ARCHIVE_RESULT_TEMPLATE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>Archive result</title>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Archive result</title>
 <style>
+  * { box-sizing: border-box; }
   body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #f4f5f7; color: #1d1f24; }
   header { background: #1d1f24; color: #fff; padding: 14px 20px; }
   header h1 { font-size: 16px; margin: 0; }
   main { padding: 20px; max-width: 800px; margin: 0 auto; }
-  code { background: #e5e7eb; padding: 2px 5px; border-radius: 4px; }
+  code { background: #e5e7eb; padding: 2px 5px; border-radius: 4px; word-break: break-all; }
   .error { color: #ef4444; margin-bottom: 16px; }
   .ok { color: #16a34a; font-weight: 600; }
   .back { display: inline-block; margin-top: 20px; font-size: 13px; color: #3b82f6; text-decoration: none; }
   .back:hover { text-decoration: underline; }
+  @media (max-width: 640px) { main { padding: 14px; } }
 </style></head>
 <body>
 <header><h1>Archive result</h1></header>
@@ -513,9 +570,11 @@ EVENT_REVIEW_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Group into events</title>
 <style>
   :root { color-scheme: light; }
+  * { box-sizing: border-box; }
   body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #f4f5f7; color: #1d1f24; }
   header { position: sticky; top: 0; background: #1d1f24; color: #fff; padding: 14px 20px; z-index: 10;
            display: flex; flex-wrap: wrap; gap: 14px; align-items: center; }
@@ -533,7 +592,7 @@ EVENT_REVIEW_TEMPLATE = """<!DOCTYPE html>
   .event-card { background: #fff; border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; box-shadow: 0 1px 2px rgba(0,0,0,.06); }
   .event-header { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }
   .event-header input.event-name { font-size: 14px; font-weight: 600; padding: 6px 8px; border-radius: 6px;
-                                     border: 1px solid #ccc; min-width: 240px; flex: 0 1 320px; }
+                                     border: 1px solid #ccc; min-width: 240px; flex: 1 1 240px; }
   .event-meta { font-size: 12px; color: #666; }
   .event-header .merge-btn { margin-left: auto; background: #444a55; color: #fff; border: none;
                               padding: 6px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; }
@@ -555,6 +614,15 @@ EVENT_REVIEW_TEMPLATE = """<!DOCTYPE html>
   .empty { text-align: center; padding: 40px; color: #888; }
   .result-row { padding: 10px 0; border-bottom: 1px solid #eee; font-size: 13px; }
   .result-row .err { color: #ef4444; }
+  @media (max-width: 700px) {
+    header { padding: 10px 12px; gap: 8px 10px; }
+    header .path { flex: 1 1 100%; order: 3; }
+    header .gap-control { margin-left: 0; }
+    main { padding: 10px; }
+    .event-card { padding: 12px; }
+    .file-card { width: calc(50% - 6px); }
+    .file-card img, .file-card .no-thumb { height: 34vw; max-height: 150px; }
+  }
 </style>
 </head>
 <body>
@@ -602,20 +670,31 @@ function clusterEvents(files, gapSeconds) {
     startTs: c[0].tsMs, endTs: c[c.length - 1].tsMs, files: c.slice(),
   }));
 
-  const others = files.filter(f => !f.is_image);
+  // Non-photo files (video, sidecars) bundle into whichever event's date
+  // range contains them, or the nearest one -- but only within the SAME
+  // gap used to split photos apart. Without this cutoff, a stray file far
+  // from every event still glues onto whichever one happens to be
+  // nearest, no matter how tight the gap is set -- which made the gap
+  // control unable to ever separate an out-of-place file from an event.
+  const others = files.filter(f => !f.is_image).slice().sort((a, b) => a.tsMs - b.tsMs);
+  const gapMs = gapSeconds * 1000;
   for (const o of others) {
-    if (events.length === 0) {
-      events.push({startTs: o.tsMs, endTs: o.tsMs, files: []});
-    }
-    let best = 0, bestDist = Infinity;
+    let best = -1, bestDist = Infinity;
     events.forEach((e, i) => {
       const dist = (o.tsMs >= e.startTs && o.tsMs <= e.endTs) ? 0
         : Math.min(Math.abs(o.tsMs - e.startTs), Math.abs(o.tsMs - e.endTs));
       if (dist < bestDist) { bestDist = dist; best = i; }
     });
-    events[best].files.push(o);
+    if (best >= 0 && bestDist <= gapMs) {
+      events[best].files.push(o);
+      events[best].startTs = Math.min(events[best].startTs, o.tsMs);
+      events[best].endTs = Math.max(events[best].endTs, o.tsMs);
+    } else {
+      events.push({ startTs: o.tsMs, endTs: o.tsMs, files: [o] });
+    }
   }
 
+  events.sort((a, b) => a.startTs - b.startTs);
   events.forEach(e => {
     e.files.sort((a, b) => a.tsMs - b.tsMs);
     e.name = suggestName(e.startTs, e.endTs);
@@ -623,9 +702,20 @@ function clusterEvents(files, gapSeconds) {
   return events;
 }
 
+// Recomputes an event's date range (and its auto-suggested name, unless
+// the user has typed a custom one) from its current files -- must be
+// called after ANY mutation to e.files (merge, nudge), or the displayed
+// range/name and the destination folder name it drives go stale.
+function recomputeEvent(e) {
+  e.files.sort((a, b) => a.tsMs - b.tsMs);
+  e.startTs = e.files[0].tsMs;
+  e.endTs = e.files[e.files.length - 1].tsMs;
+  if (!e.nameEdited) e.name = suggestName(e.startTs, e.endTs);
+}
+
 function fileCardHtml(f) {
   const thumb = f.is_image
-    ? `<img src="data:image/jpeg;base64,${f.thumb || ''}" loading="lazy">`
+    ? `<img src="/archive/events/thumb?path=${encodeURIComponent(f.path)}" loading="lazy">`
     : `<div class="no-thumb">&#128206;</div>`;
   return `
     <div class="file-card ${f.excluded ? 'excluded' : ''}" data-path="${escapeHtml(f.path)}">
@@ -672,6 +762,7 @@ function recluster() {
 function mergeWithPrevious(idx) {
   if (idx <= 0) return;
   STATE[idx - 1].files = STATE[idx - 1].files.concat(STATE[idx].files);
+  recomputeEvent(STATE[idx - 1]);
   STATE.splice(idx, 1);
   render();
 }
@@ -684,8 +775,12 @@ function moveFile(idx, path, dir) {
   if (fi < 0) return;
   const [f] = arr.splice(fi, 1);
   STATE[target].files.push(f);
-  STATE[target].files.sort((a, b) => a.tsMs - b.tsMs);
-  if (STATE[idx].files.length === 0) STATE.splice(idx, 1);
+  recomputeEvent(STATE[target]);
+  if (STATE[idx].files.length === 0) {
+    STATE.splice(idx, 1);
+  } else {
+    recomputeEvent(STATE[idx]);
+  }
   render();
 }
 
@@ -709,8 +804,22 @@ document.getElementById('main').addEventListener('click', (ev) => {
 document.getElementById('main').addEventListener('input', (ev) => {
   if (ev.target.dataset.action !== 'rename') return;
   const card = ev.target.closest('.event-card');
-  STATE[parseInt(card.dataset.eventIndex, 10)].name = ev.target.value;
+  const e = STATE[parseInt(card.dataset.eventIndex, 10)];
+  e.name = ev.target.value;
+  e.nameEdited = true;  // stop auto-renaming this event on merge/nudge
 });
+
+// 'error' does not bubble on <img>, so this delegated listener must run in
+// the capture phase to catch it. Fires for a photo whose event-thumb
+// fetch 404s (worker failed on that file) -- swap in the same placeholder
+// non-image files already use instead of leaving a broken-image icon.
+document.getElementById('main').addEventListener('error', (ev) => {
+  if (ev.target.tagName !== 'IMG') return;
+  const placeholder = document.createElement('div');
+  placeholder.className = 'no-thumb';
+  placeholder.textContent = String.fromCodePoint(0x1F4F7);
+  ev.target.replaceWith(placeholder);
+}, true);
 
 document.getElementById('main').addEventListener('change', (ev) => {
   if (ev.target.dataset.action !== 'toggle-exclude') return;
@@ -776,26 +885,34 @@ recluster();
 # button danger-styling, and which route they post to.
 TRASH_BROWSE_TEMPLATE = """<!doctype html>
 <html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{ 'Purge' if mode == 'purge' else 'Restore' }} deleted photos</title>
 <style>
+  * { box-sizing: border-box; }
   body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #f4f5f7; color: #1d1f24; }
-  header { background: #1d1f24; color: #fff; padding: 14px 20px; display: flex; align-items: center; gap: 16px; }
+  header { background: #1d1f24; color: #fff; padding: 14px 20px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
   header h1 { font-size: 16px; margin: 0; }
-  header a.nav-link { color: #93c5fd; font-size: 13px; text-decoration: none; }
+  header a.nav-link { color: #93c5fd; font-size: 13px; text-decoration: none; padding: 4px 0; }
   header a.nav-link:first-of-type { margin-left: auto; }
   header a.nav-link:hover { text-decoration: underline; }
   main { padding: 20px; max-width: 800px; margin: 0 auto; }
   .breadcrumb { font-size: 13px; color: #666; margin-bottom: 16px; word-break: break-all; }
   p.hint { font-size: 13px; color: #666; }
   ul { list-style: none; padding: 0; }
-  li { margin-bottom: 6px; }
-  a { color: #3b82f6; text-decoration: none; }
+  li { margin-bottom: 4px; }
+  a { color: #3b82f6; text-decoration: none; display: inline-block; padding: 8px 4px; }
   a:hover { text-decoration: underline; }
   .scan-btn { margin-bottom: 20px; }
-  .scan-btn button { color: #fff; border: none; padding: 10px 16px; border-radius: 6px; font-size: 14px; cursor: pointer;
+  .scan-btn button { color: #fff; border: none; padding: 12px 18px; border-radius: 6px; font-size: 15px; cursor: pointer;
+                      width: 100%; max-width: 420px;
                       background: {{ '#dc2626' if mode == 'purge' else '#3b82f6' }}; }
   .scan-btn button:hover { filter: brightness(1.1); }
   .error { color: #ef4444; margin-bottom: 16px; }
+  @media (max-width: 640px) {
+    header { padding: 10px 14px; }
+    header a.nav-link:first-of-type { margin-left: 0; }
+    main { padding: 14px; }
+  }
 </style></head>
 <body>
 <header>
@@ -832,20 +949,28 @@ TRASH_BROWSE_TEMPLATE = """<!doctype html>
 """
 
 TRASH_CONFIRM_TEMPLATE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>Confirm {{ mode }}</title>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Confirm {{ mode }}</title>
 <style>
+  * { box-sizing: border-box; }
   body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #f4f5f7; color: #1d1f24; }
   header { background: #1d1f24; color: #fff; padding: 14px 20px; }
   header h1 { font-size: 16px; margin: 0; }
   main { padding: 20px; max-width: 800px; margin: 0 auto; }
-  code { background: #e5e7eb; padding: 2px 5px; border-radius: 4px; }
-  button { border: none; padding: 10px 16px; border-radius: 6px; font-size: 14px; cursor: pointer; margin-top: 16px; }
+  code { background: #e5e7eb; padding: 2px 5px; border-radius: 4px; word-break: break-all; }
+  button { border: none; padding: 12px 18px; border-radius: 6px; font-size: 15px; cursor: pointer; margin-top: 16px; }
   button.danger { background: #dc2626; color: #fff; }
   button.primary { background: #3b82f6; color: #fff; }
   button:hover { filter: brightness(1.1); }
   .error { color: #ef4444; margin-bottom: 16px; }
   .back { display: inline-block; margin-top: 20px; margin-left: 10px; font-size: 13px; color: #3b82f6; text-decoration: none; }
   .back:hover { text-decoration: underline; }
+  @media (max-width: 640px) {
+    main { padding: 14px; }
+    button { display: block; width: 100%; }
+    .back { margin-left: 0; }
+  }
 </style></head>
 <body>
 <header><h1>Confirm {{ mode }}</h1></header>
@@ -879,17 +1004,21 @@ TRASH_CONFIRM_TEMPLATE = """<!doctype html>
 """
 
 TRASH_RESULT_TEMPLATE = """<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><title>{{ 'Purge' if mode == 'purge' else 'Restore' }} result</title>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ 'Purge' if mode == 'purge' else 'Restore' }} result</title>
 <style>
+  * { box-sizing: border-box; }
   body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #f4f5f7; color: #1d1f24; }
   header { background: #1d1f24; color: #fff; padding: 14px 20px; }
   header h1 { font-size: 16px; margin: 0; }
   main { padding: 20px; max-width: 800px; margin: 0 auto; }
-  code { background: #e5e7eb; padding: 2px 5px; border-radius: 4px; }
+  code { background: #e5e7eb; padding: 2px 5px; border-radius: 4px; word-break: break-all; }
   .error { color: #ef4444; margin-bottom: 16px; }
   .ok { color: #16a34a; font-weight: 600; }
   .back { display: inline-block; margin-top: 20px; font-size: 13px; color: #3b82f6; text-decoration: none; }
   .back:hover { text-decoration: underline; }
+  @media (max-width: 640px) { main { padding: 14px; } }
 </style></head>
 <body>
 <header><h1>{{ 'Purge' if mode == 'purge' else 'Restore' }} result</h1></header>
@@ -930,9 +1059,11 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Duplicate photo review (remote)</title>
 <style>
   :root { color-scheme: light; }
+  * { box-sizing: border-box; }
   body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #f4f5f7; color: #1d1f24; }
   header { position: sticky; top: 0; background: #1d1f24; color: #fff; padding: 14px 20px; z-index: 10;
            display: flex; flex-wrap: wrap; gap: 16px; align-items: center; }
@@ -1029,6 +1160,26 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .cmp-side select { background: #2a2d35; color: #fff; border: 1px solid #444; border-radius: 6px;
                       padding: 6px 8px; font-size: 12px; flex: 1; }
   .cmp-side label { font-size: 12px; display: flex; align-items: center; gap: 6px; white-space: nowrap; }
+
+  @media (max-width: 700px) {
+    header { padding: 10px 12px; gap: 6px 10px; }
+    header h1 { flex: 1 1 auto; }
+    header .path { flex: 1 1 100%; order: 3; font-size: 11px; }
+    header .stat { flex: 1 1 100%; order: 4; font-size: 12px; }
+    header button, header a.nav-link { font-size: 12.5px; padding: 8px 10px; }
+    main { padding: 10px; }
+    .group { padding: 12px; }
+    .photo-card { width: calc(50% - 6px); }
+    .photo-card img { height: 34vw; max-height: 190px; }
+    .cmp-stage-btn { width: 32px; height: 32px; font-size: 17px; }
+    .lightbox .lb-bar { top: 10px; right: 10px; }
+    .lightbox .lb-nav { width: 40px; height: 40px; font-size: 18px; }
+    .lightbox .lb-prev { left: 6px; } .lightbox .lb-next { right: 6px; }
+    .compare-topbar { padding: 8px 10px; gap: 8px; flex-wrap: wrap; }
+    .compare-topbar .cmp-title { flex: 1 1 auto; font-size: 13px; }
+    .compare-bottombar { padding: 10px 12px; gap: 10px; }
+    .cmp-side { min-width: 100%; }
+  }
 </style>
 </head>
 <body>
@@ -1861,14 +2012,18 @@ def do_archive():
 
 @app.route("/archive/events/scan", methods=["POST"])
 def archive_events_scan():
+    # Deliberately ignores the date_from/date_to fields the shared
+    # archive-confirm form also submits (they're for the plain whole-tree
+    # move's mtime-based filter, see do_archive) -- pre-narrowing this
+    # flow's folder walk by mtime was found to silently drop real matches
+    # (e.g. 37 photos on a real EXIF-verified day down to 7) on netbooks
+    # where mtime doesn't track capture date. This flow's whole purpose is
+    # discovering event boundaries by real EXIF time across the folder;
+    # narrowing to one date is what the review page's per-event
+    # exclude/skip controls are for, after clustering has already happened.
     path = request.form.get("path")
     if not path:
         abort(400)
-    date_from_str = request.form.get("date_from", "")
-    date_to_str = request.form.get("date_to", "")
-    date_from_ts, date_to_ts, date_error = _parse_date_range(date_from_str, date_to_str)
-    if date_error:
-        abort(400, date_error)
 
     with EVENT_SCAN_LOCK:
         if EVENT_SCAN_STATE["running"]:
@@ -1891,7 +2046,6 @@ def archive_events_scan():
                 path, CONFIG["out_dir"],
                 host=CONFIG["host"], port=CONFIG["port"], username=CONFIG["username"],
                 key_filename=CONFIG["key_filename"], password=CONFIG["password"],
-                date_from=date_from_ts, date_to=date_to_ts,
                 workers=CONFIG["workers"], max_seconds=None,
                 progress_cb=progress_cb,
             )
@@ -1939,29 +2093,24 @@ def archive_events_review():
     if not scan_result:
         return redirect(url_for("archive_browse"))
 
-    out_dir = Path(CONFIG["out_dir"])
-    ts_cache = {}
-    if (out_dir / "event_ts_cache.json").exists():
-        with open(out_dir / "event_ts_cache.json", encoding="utf-8") as f:
-            ts_cache = json.load(f)
-    thumb_cache = {}
-    if (out_dir / "event_thumb_cache.json").exists():
-        with open(out_dir / "event_thumb_cache.json", encoding="utf-8") as f:
-            thumb_cache = json.load(f)
+    ts_cache = _load_event_cache("event_ts_cache.json")
 
+    # Thumbnails are NOT inlined here (see archive_events_thumb below) --
+    # at "every photo in the folder" scale, embedding thousands of base64
+    # blobs in one HTML response made both the page payload and every
+    # merge/recluster re-render (which rebuilds the whole DOM from this
+    # JSON) heavy enough to visibly freeze the tab. The JS instead points
+    # each <img> at that endpoint and lets the browser load them lazily.
     files = []
     for path in scan_result["images"]:
         e = ts_cache.get(path)
         if not e:
             continue  # scan didn't finish caching this one -- shouldn't happen once "complete"
-        files.append({
-            "path": path, "name": path.rsplit("/", 1)[-1], "ts": e["ts"],
-            "thumb": thumb_cache.get(path) or "", "is_image": True,
-        })
+        files.append({"path": path, "name": path.rsplit("/", 1)[-1], "ts": e["ts"], "is_image": True})
     for o in scan_result["others"]:
         files.append({
             "path": o["path"], "name": o["path"].rsplit("/", 1)[-1],
-            "ts": datetime.fromtimestamp(o["mtime"]).isoformat(), "thumb": "", "is_image": False,
+            "ts": datetime.fromtimestamp(o["mtime"]).isoformat(), "is_image": False,
         })
 
     files_json_str = json.dumps(files).replace("</", "<\\/")
@@ -1970,6 +2119,27 @@ def archive_events_review():
     html = html.replace("__GAP_HOURS__", str(EVENT_GAP_SECONDS // 3600))
     html = html.replace("__SCAN_ROOT__", str(escape(scan_result["root"])))
     return html
+
+
+@app.route("/archive/events/thumb")
+def archive_events_thumb():
+    """Lazy-loaded thumbnail for the event-review grid, read straight from
+    event_thumb_cache.json (see _load_event_cache's memoization) -- no SSH
+    involved, this only ever reads a local disk cache the scan already
+    populated, so it doesn't contend with _client_lock. Exists because
+    inlining every photo's base64 thumbnail into one review page response
+    made both that response and every merge/recluster re-render heavy at
+    "every photo in the folder" scale."""
+    path = request.args.get("path")
+    if not path:
+        abort(400)
+    thumb_cache = _load_event_cache("event_thumb_cache.json")
+    b64 = thumb_cache.get(path)
+    if not b64:
+        abort(404)
+    resp = Response(base64.b64decode(b64), mimetype="image/jpeg")
+    resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+    return resp
 
 
 @app.route("/archive/events/confirm", methods=["POST"])
