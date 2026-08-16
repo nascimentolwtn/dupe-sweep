@@ -121,7 +121,10 @@ It also has an **archive mode**, for when that machine's photo folder is a
 live two-way sync target (e.g. Syncthing from the phone): it relocates a
 chosen folder into a separate, sync-untouched archive folder first (same
 disk, instant), so it's safe to delete the phone-side originals afterwards
-without the sync tool racing the cleanup.
+without the sync tool racing the cleanup. And a **purge/restore mode**,
+since deleting only ever moves a file into a `_to_delete` folder: purge
+permanently removes those files (the one irreversible operation in the
+tool), restore moves them back to where they were deleted from.
 
 See `python/mvp2-remote/README_MVP2.md` for setup and usage, and
 `python/mvp1/README_MVP1.md` for the original local-only variant this was

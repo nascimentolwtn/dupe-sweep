@@ -74,6 +74,27 @@ def _walk_entries(sftp, root):
                 yield full, entry
 
 
+def _walk_all(sftp, root):
+    """Recursive walk yielding (full_path, SFTPAttributes, is_dir) for every
+    entry under root, files and directories alike, with no skipping -- used
+    by purge/restore, which need to see _to_delete folders themselves
+    (unlike _walk_entries, which skips into them)."""
+    root = str(root)
+    stack = [root]
+    while stack:
+        current = stack.pop()
+        try:
+            entries = sftp.listdir_attr(current)
+        except IOError:
+            continue
+        for entry in entries:
+            full = f"{current.rstrip('/')}/{entry.filename}"
+            is_dir = stat.S_ISDIR(entry.st_mode)
+            yield full, entry, is_dir
+            if is_dir:
+                stack.append(full)
+
+
 def list_images(sftp, root):
     """Recursive walk mirroring python-mvp1's list_images(). Yields a dict
     per image file with the size/mtime already captured from the listing
@@ -216,5 +237,125 @@ def move_tree(sftp, src_root, dst_root, min_age_seconds=300, date_from=None, dat
         "moved_bytes": moved_bytes,
         "skipped_recent": skipped_recent,
         "skipped_collision_renamed": skipped_collision_renamed,
+        "errors": errors,
+    }
+
+
+def find_trash_dirs(sftp, root):
+    """Every _to_delete folder anywhere under root, as a sorted list of
+    paths. move_to_trash() creates one per parent folder it's ever deleted
+    from, so these can be scattered throughout a tree rather than living in
+    one place."""
+    found = []
+    for full, _entry, is_dir in _walk_all(sftp, root):
+        if is_dir and full.rsplit("/", 1)[-1] == TRASH_DIRNAME:
+            found.append(full)
+    return sorted(found)
+
+
+def count_trash(sftp, root):
+    """Preview for purge/restore: how many _to_delete folders, files, and
+    bytes are under root, without touching anything."""
+    trash_dirs = find_trash_dirs(sftp, root)
+    files = 0
+    total_bytes = 0
+    for d in trash_dirs:
+        for info in list_files(sftp, d):
+            files += 1
+            total_bytes += info["size"]
+    return {"dirs": len(trash_dirs), "files": files, "bytes": total_bytes}
+
+
+def _remove_empty_dirs(sftp, root):
+    """Remove root and any now-empty subdirectories left after moving files
+    out of it, deepest first. Silently skips anything not empty or already
+    gone -- best-effort tidy-up, not required for correctness."""
+    dirs = [root]
+    for full, _entry, is_dir in _walk_all(sftp, root):
+        if is_dir:
+            dirs.append(full)
+    for d in sorted(dirs, key=len, reverse=True):
+        try:
+            sftp.rmdir(d)
+        except IOError:
+            pass
+
+
+def purge_trash(sftp, root):
+    """Find every _to_delete folder under root and permanently remove its
+    contents -- the one genuinely destructive operation in this tool, kept
+    separate and opt-in from move_to_trash()'s move-not-delete default.
+    Returns a summary dict: dirs_purged, files_removed, bytes_removed,
+    errors."""
+    trash_dirs = find_trash_dirs(sftp, root)
+    files_removed = 0
+    bytes_removed = 0
+    errors = []
+
+    for trash_dir in trash_dirs:
+        sub_files = []
+        sub_dirs = [trash_dir]
+        for full, entry, is_dir in _walk_all(sftp, trash_dir):
+            if is_dir:
+                sub_dirs.append(full)
+            else:
+                sub_files.append((full, entry.st_size))
+        for path, size in sub_files:
+            try:
+                sftp.remove(path)
+                files_removed += 1
+                bytes_removed += size
+            except Exception as e:
+                errors.append((path, str(e)))
+        for d in sorted(sub_dirs, key=len, reverse=True):
+            try:
+                sftp.rmdir(d)
+            except Exception as e:
+                errors.append((d, str(e)))
+
+    return {
+        "dirs_purged": len(trash_dirs),
+        "files_removed": files_removed,
+        "bytes_removed": bytes_removed,
+        "errors": errors,
+    }
+
+
+def restore_trash(sftp, root):
+    """Find every _to_delete folder under root and move each file back to
+    the folder it was deleted from (the parent of the _to_delete folder it
+    landed in) -- undoes move_to_trash(). Name collisions at the
+    destination (e.g. a same-named file recreated since the delete) get the
+    same _1/_2 suffix treatment as move_to_trash(). Now-empty _to_delete
+    folders are removed afterward. Returns a summary dict: restored,
+    restored_bytes, collisions_renamed, errors."""
+    trash_dirs = find_trash_dirs(sftp, root)
+    restored = 0
+    restored_bytes = 0
+    collisions_renamed = 0
+    errors = []
+
+    for trash_dir in trash_dirs:
+        parent = trash_dir.rsplit("/", 1)[0]
+        for info in list_files(sftp, trash_dir):
+            path = info["path"]
+            rel = path[len(trash_dir):].lstrip("/")
+            dest = f"{parent}/{rel}"
+            try:
+                _ensure_dir(sftp, dest.rsplit("/", 1)[0])
+                final_dest = _resolve_collision(sftp, dest)
+                if final_dest != dest:
+                    collisions_renamed += 1
+                sftp.rename(path, final_dest)
+                restored += 1
+                restored_bytes += info["size"]
+            except Exception as e:
+                errors.append((path, str(e)))
+        _remove_empty_dirs(sftp, trash_dir)
+
+    return {
+        "restored": restored,
+        "restored_bytes": restored_bytes,
+        "collisions_renamed": collisions_renamed,
         "errors": errors,
     }

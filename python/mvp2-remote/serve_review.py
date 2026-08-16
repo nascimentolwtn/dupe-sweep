@@ -23,6 +23,19 @@ Routes:
                             (+ optional date_from/date_to) before moving
   POST /archive             moves the confirmed folder from --sync-root
                             into --archive-root via remote_client.move_tree()
+  GET  /purge/browse        folder-picker UI rooted at --start-path, for
+                            picking a subtree to purge _to_delete folders in
+  GET  /purge/confirm       preview: how many _to_delete folders/files/bytes
+                            would be permanently removed under the chosen path
+  POST /purge               permanently deletes those files via
+                            remote_client.purge_trash() -- the only
+                            irreversible operation in this tool
+  GET  /restore/browse      folder-picker UI rooted at --start-path, for
+                            picking a subtree to restore _to_delete folders in
+  GET  /restore/confirm     preview: how many _to_delete folders/files/bytes
+                            would be restored under the chosen path
+  POST /restore             moves those files back to where they were
+                            deleted from via remote_client.restore_trash()
 
 Usage:
     python3 serve_review.py --host 192.168.4.36 --out-dir ./run
@@ -119,7 +132,8 @@ BROWSE_TEMPLATE = """<!doctype html>
   body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #f4f5f7; color: #1d1f24; }
   header { background: #1d1f24; color: #fff; padding: 14px 20px; display: flex; align-items: center; gap: 16px; }
   header h1 { font-size: 16px; margin: 0; }
-  header a.nav-link { color: #93c5fd; font-size: 13px; text-decoration: none; margin-left: auto; }
+  header a.nav-link { color: #93c5fd; font-size: 13px; text-decoration: none; }
+  header a.nav-link:first-of-type { margin-left: auto; }
   header a.nav-link:hover { text-decoration: underline; }
   main { padding: 20px; max-width: 800px; margin: 0 auto; }
   .breadcrumb { font-size: 13px; color: #666; margin-bottom: 16px; word-break: break-all; }
@@ -134,7 +148,10 @@ BROWSE_TEMPLATE = """<!doctype html>
   .error { color: #ef4444; margin-bottom: 16px; }
 </style></head>
 <body>
-<header><h1>Browse netbook folders</h1><a class="nav-link" href="{{ url_for('archive_browse') }}">Archive mode &rarr;</a></header>
+<header><h1>Browse netbook folders</h1>
+  <a class="nav-link" href="{{ url_for('archive_browse') }}">Archive mode &rarr;</a>
+  <a class="nav-link" href="{{ url_for('purge_browse') }}">Purge/restore &rarr;</a>
+</header>
 <main>
   <div class="breadcrumb">{{ path }}</div>
   {% if error %}<div class="error">Could not list this folder: {{ error }}</div>{% endif %}
@@ -181,7 +198,8 @@ ARCHIVE_BROWSE_TEMPLATE = """<!doctype html>
   body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #f4f5f7; color: #1d1f24; }
   header { background: #1d1f24; color: #fff; padding: 14px 20px; display: flex; align-items: center; gap: 16px; }
   header h1 { font-size: 16px; margin: 0; }
-  header a.nav-link { color: #93c5fd; font-size: 13px; text-decoration: none; margin-left: auto; }
+  header a.nav-link { color: #93c5fd; font-size: 13px; text-decoration: none; }
+  header a.nav-link:first-of-type { margin-left: auto; }
   header a.nav-link:hover { text-decoration: underline; }
   main { padding: 20px; max-width: 800px; margin: 0 auto; }
   .breadcrumb { font-size: 13px; color: #666; margin-bottom: 16px; word-break: break-all; }
@@ -196,7 +214,10 @@ ARCHIVE_BROWSE_TEMPLATE = """<!doctype html>
   .error { color: #ef4444; margin-bottom: 16px; }
 </style></head>
 <body>
-<header><h1>Archive netbook folders</h1><a class="nav-link" href="{{ url_for('browse') }}">Dedup scan mode &rarr;</a></header>
+<header><h1>Archive netbook folders</h1>
+  <a class="nav-link" href="{{ url_for('browse') }}">Dedup scan mode &rarr;</a>
+  <a class="nav-link" href="{{ url_for('purge_browse') }}">Purge/restore &rarr;</a>
+</header>
 <main>
   <div class="breadcrumb">{{ path }}</div>
   <p style="font-size:13px;color:#666">Moving a folder here relocates it (same-disk, instant) from
@@ -293,6 +314,157 @@ ARCHIVE_RESULT_TEMPLATE = """<!doctype html>
 </body></html>
 """
 
+# Purge/restore mode: cleans up _to_delete folders left behind by /delete.
+# Purge permanently removes their contents (the one destructive operation in
+# this tool); restore undoes a delete by moving files back to where they
+# came from. Both share one browse/confirm/result template trio parameterized
+# by `mode` ("purge" or "restore") since they're identical apart from wording,
+# button danger-styling, and which route they post to.
+TRASH_BROWSE_TEMPLATE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<title>{{ 'Purge' if mode == 'purge' else 'Restore' }} deleted photos</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #f4f5f7; color: #1d1f24; }
+  header { background: #1d1f24; color: #fff; padding: 14px 20px; display: flex; align-items: center; gap: 16px; }
+  header h1 { font-size: 16px; margin: 0; }
+  header a.nav-link { color: #93c5fd; font-size: 13px; text-decoration: none; }
+  header a.nav-link:first-of-type { margin-left: auto; }
+  header a.nav-link:hover { text-decoration: underline; }
+  main { padding: 20px; max-width: 800px; margin: 0 auto; }
+  .breadcrumb { font-size: 13px; color: #666; margin-bottom: 16px; word-break: break-all; }
+  p.hint { font-size: 13px; color: #666; }
+  ul { list-style: none; padding: 0; }
+  li { margin-bottom: 6px; }
+  a { color: #3b82f6; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .scan-btn { margin-top: 20px; }
+  .scan-btn button { color: #fff; border: none; padding: 10px 16px; border-radius: 6px; font-size: 14px; cursor: pointer;
+                      background: {{ '#dc2626' if mode == 'purge' else '#3b82f6' }}; }
+  .scan-btn button:hover { filter: brightness(1.1); }
+  .error { color: #ef4444; margin-bottom: 16px; }
+</style></head>
+<body>
+<header>
+  <h1>{{ 'Purge' if mode == 'purge' else 'Restore' }} deleted photos</h1>
+  <a class="nav-link" href="{{ url_for('restore_browse' if mode == 'purge' else 'purge_browse', path=path) }}">{{ 'Restore mode' if mode == 'purge' else 'Purge mode' }} &rarr;</a>
+  <a class="nav-link" href="{{ url_for('browse') }}">Dedup scan mode &rarr;</a>
+</header>
+<main>
+  <div class="breadcrumb">{{ path }}</div>
+  <p class="hint">
+    {% if mode == 'purge' %}
+    Finds every <code>_to_delete</code> folder under here and <strong>permanently</strong> removes its
+    contents. This cannot be undone.
+    {% else %}
+    Finds every <code>_to_delete</code> folder under here and moves its files back to the folder each
+    was deleted from.
+    {% endif %}
+  </p>
+  {% if error %}<div class="error">Could not list this folder: {{ error }}</div>{% endif %}
+  <ul>
+    {% if path != '/' %}<li><a href="{{ url_for(mode + '_browse', path=parent) }}">.. (up)</a></li>{% endif %}
+    {% for d in subdirs %}
+      <li><a href="{{ url_for(mode + '_browse', path=(path.rstrip('/') + '/' + d)) }}">{{ d }}/</a></li>
+    {% endfor %}
+  </ul>
+  <form class="scan-btn" method="get" action="{{ url_for(mode + '_confirm') }}">
+    <input type="hidden" name="path" value="{{ path }}">
+    <button type="submit">Find _to_delete folders here</button>
+  </form>
+</main>
+</body></html>
+"""
+
+TRASH_CONFIRM_TEMPLATE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Confirm {{ mode }}</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #f4f5f7; color: #1d1f24; }
+  header { background: #1d1f24; color: #fff; padding: 14px 20px; }
+  header h1 { font-size: 16px; margin: 0; }
+  main { padding: 20px; max-width: 800px; margin: 0 auto; }
+  code { background: #e5e7eb; padding: 2px 5px; border-radius: 4px; }
+  button { border: none; padding: 10px 16px; border-radius: 6px; font-size: 14px; cursor: pointer; margin-top: 16px; }
+  button.danger { background: #dc2626; color: #fff; }
+  button.primary { background: #3b82f6; color: #fff; }
+  button:hover { filter: brightness(1.1); }
+  .error { color: #ef4444; margin-bottom: 16px; }
+  .back { display: inline-block; margin-top: 20px; margin-left: 10px; font-size: 13px; color: #3b82f6; text-decoration: none; }
+  .back:hover { text-decoration: underline; }
+</style></head>
+<body>
+<header><h1>Confirm {{ mode }}</h1></header>
+<main>
+  <p>Source: <code>{{ path }}</code></p>
+  {% if error %}
+  <div class="error">{{ error }}</div>
+  {% elif summary.dirs == 0 %}
+  <p>No <code>_to_delete</code> folders found under here &mdash; nothing to {{ mode }}.</p>
+  {% else %}
+  <p><strong>{{ summary.dirs }}</strong> <code>_to_delete</code> folder(s) containing
+     <strong>{{ summary.files }}</strong> file(s), <strong>{{ "%.1f"|format(summary.bytes / (1024*1024)) }} MB</strong> total.</p>
+  {% if mode == 'purge' %}
+  <p>Confirming will <strong>permanently delete</strong> these files. This cannot be undone.</p>
+  <form method="post" action="{{ url_for('do_purge') }}"
+        onsubmit="return confirm('Permanently delete {{ summary.files }} file(s)? This cannot be undone.');">
+    <input type="hidden" name="path" value="{{ path }}">
+    <button type="submit" class="danger">Confirm: permanently delete</button>
+  </form>
+  {% else %}
+  <p>Confirming will move these files back to the folders they were deleted from.</p>
+  <form method="post" action="{{ url_for('do_restore') }}">
+    <input type="hidden" name="path" value="{{ path }}">
+    <button type="submit" class="primary">Confirm: restore these files</button>
+  </form>
+  {% endif %}
+  {% endif %}
+  <a class="back" href="{{ url_for(mode + '_browse', path=path) }}">&larr; back to browse</a>
+</main>
+</body></html>
+"""
+
+TRASH_RESULT_TEMPLATE = """<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>{{ 'Purge' if mode == 'purge' else 'Restore' }} result</title>
+<style>
+  body { font-family: -apple-system, Segoe UI, Roboto, sans-serif; margin: 0; background: #f4f5f7; color: #1d1f24; }
+  header { background: #1d1f24; color: #fff; padding: 14px 20px; }
+  header h1 { font-size: 16px; margin: 0; }
+  main { padding: 20px; max-width: 800px; margin: 0 auto; }
+  code { background: #e5e7eb; padding: 2px 5px; border-radius: 4px; }
+  .error { color: #ef4444; margin-bottom: 16px; }
+  .ok { color: #16a34a; font-weight: 600; }
+  .back { display: inline-block; margin-top: 20px; font-size: 13px; color: #3b82f6; text-decoration: none; }
+  .back:hover { text-decoration: underline; }
+</style></head>
+<body>
+<header><h1>{{ 'Purge' if mode == 'purge' else 'Restore' }} result</h1></header>
+<main>
+  {% if error %}
+  <div class="error">{{ mode|capitalize }} failed: {{ error }}</div>
+  {% elif mode == 'purge' %}
+  <p class="ok">Permanently removed <strong>{{ summary.files_removed }}</strong> file(s)
+     (<strong>{{ "%.1f"|format(summary.bytes_removed / (1024*1024)) }} MB</strong>) from
+     <strong>{{ summary.dirs_purged }}</strong> <code>_to_delete</code> folder(s) under <code>{{ path }}</code>.</p>
+  {% if summary.errors %}
+  <div class="error">{{ summary.errors|length }} error(s):<br>
+  {% for p, e in summary.errors %}{{ p }}: {{ e }}<br>{% endfor %}
+  </div>
+  {% endif %}
+  {% else %}
+  <p class="ok">Restored <strong>{{ summary.restored }}</strong> file(s)
+     (<strong>{{ "%.1f"|format(summary.restored_bytes / (1024*1024)) }} MB</strong>) from <code>_to_delete</code>
+     back to their original folders under <code>{{ path }}</code>.</p>
+  <p>Renamed due to a name collision at the destination: {{ summary.collisions_renamed }}</p>
+  {% if summary.errors %}
+  <div class="error">{{ summary.errors|length }} error(s):<br>
+  {% for p, e in summary.errors %}{{ p }}: {{ e }}<br>{% endfor %}
+  </div>
+  {% endif %}
+  {% endif %}
+  <a class="back" href="{{ url_for(mode + '_browse') }}">&larr; back to {{ mode }} browse</a>
+</main>
+</body></html>
+"""
+
 # Adapted from python-mvp1/build_review_html.py's HTML_TEMPLATE: the CSV
 # export button becomes a "Delete marked" button that POSTs to /delete, and
 # the file:// lightbox trick becomes a fetch to /raw?path=... since the
@@ -366,6 +538,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   <input type="file" id="load-progress-input" accept="application/json" style="display:none">
   <button id="delete-btn" class="danger">Delete marked</button>
   <a href="/archive/browse" style="color:#93c5fd;font-size:13px;text-decoration:none;margin-left:auto">Archive mode &rarr;</a>
+  <a href="/purge/browse" style="color:#93c5fd;font-size:13px;text-decoration:none">Purge/restore &rarr;</a>
 </header>
 <div class="lightbox" id="lightbox">
   <div class="lb-bar">
@@ -900,6 +1073,77 @@ def do_archive():
             error = str(e)
 
     return render_template_string(ARCHIVE_RESULT_TEMPLATE, path=path, dest=dest_root, summary=summary, error=error)
+
+
+@app.route("/purge/browse")
+def purge_browse():
+    return _trash_browse("purge")
+
+
+@app.route("/restore/browse")
+def restore_browse():
+    return _trash_browse("restore")
+
+
+def _trash_browse(mode):
+    path = request.args.get("path", CONFIG["start_path"])
+    path = posixpath.normpath(path)
+    try:
+        subdirs = _sftp_call(lambda sftp: remote_client.list_subdirs(sftp, path))
+        error = None
+    except Exception as e:
+        subdirs = []
+        error = str(e)
+    parent = posixpath.dirname(path.rstrip("/")) or "/"
+    return render_template_string(TRASH_BROWSE_TEMPLATE, mode=mode, path=path, subdirs=subdirs, parent=parent, error=error)
+
+
+@app.route("/purge/confirm")
+def purge_confirm():
+    return _trash_confirm("purge")
+
+
+@app.route("/restore/confirm")
+def restore_confirm():
+    return _trash_confirm("restore")
+
+
+def _trash_confirm(mode):
+    path = request.args.get("path")
+    if not path:
+        abort(400)
+    try:
+        summary = _sftp_call(lambda sftp: remote_client.count_trash(sftp, path))
+        error = None
+    except Exception as e:
+        summary, error = None, str(e)
+    return render_template_string(TRASH_CONFIRM_TEMPLATE, mode=mode, path=path, summary=summary, error=error)
+
+
+@app.route("/purge", methods=["POST"])
+def do_purge():
+    path = request.form.get("path")
+    if not path:
+        abort(400)
+    try:
+        summary = _sftp_call(lambda sftp: remote_client.purge_trash(sftp, path))
+        error = None
+    except Exception as e:
+        summary, error = None, str(e)
+    return render_template_string(TRASH_RESULT_TEMPLATE, mode="purge", path=path, summary=summary, error=error)
+
+
+@app.route("/restore", methods=["POST"])
+def do_restore():
+    path = request.form.get("path")
+    if not path:
+        abort(400)
+    try:
+        summary = _sftp_call(lambda sftp: remote_client.restore_trash(sftp, path))
+        error = None
+    except Exception as e:
+        summary, error = None, str(e)
+    return render_template_string(TRASH_RESULT_TEMPLATE, mode="restore", path=path, summary=summary, error=error)
 
 
 def main():

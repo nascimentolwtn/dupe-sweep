@@ -203,8 +203,10 @@ remote machine — no server or new dependency is installed there, just the
 - `remote_client.py` — SSH/SFTP connect, recursive remote walks
   (`list_images` for photos, `list_files` for every file), folder-picker
   listing (`list_subdirs`), prefetched bulk reads (`read_bytes`),
-  move-to-`_to_delete` with collision handling (`move_to_trash`), and
-  recursive same-disk relocation for archive mode (`move_tree`).
+  move-to-`_to_delete` with collision handling (`move_to_trash`), recursive
+  same-disk relocation for archive mode (`move_tree`), and cleanup of
+  `_to_delete` folders (`find_trash_dirs`, `count_trash`, `purge_trash`,
+  `restore_trash`).
 - `scan_remote.py` — staged, threaded, resumable hash → cluster → score →
   thumbnail pipeline (`run_scan()`, importable). CLI power-user shortcut:
   `python3 scan_remote.py <remote-folder> --host 192.168.4.36 --out-dir ./run`.
@@ -217,7 +219,12 @@ remote machine — no server or new dependency is installed there, just the
   instant, skipping `_to_delete` folders and anything modified within
   `--archive-min-age-seconds` (default 300, still-syncing guard). This is
   what makes it safe to delete originals from a folder under active
-  two-way sync — see the caution below.
+  two-way sync — see the caution below. Also hosts **purge/restore mode**
+  (`/purge/browse`+`/purge/confirm`+`POST /purge`, and the `/restore/*`
+  equivalents) — since `/delete` only ever moves a file into `_to_delete`,
+  this is where you either permanently remove those files (`purge`, the one
+  irreversible operation in this tool) or move them back to where they were
+  deleted from (`restore`).
 - Setup: `pip install -r python/mvp2-remote/requirements.txt` (adds
   `paramiko`, `flask` on top of mvp1's deps). SSH key-based auth to the
   remote machine is a prerequisite, set up outside this code.
@@ -259,6 +266,10 @@ python3 serve_review.py --host 192.168.4.36 --out-dir ./run
 # folder out of live sync (default /media/backup/sync_data) into a stable
 # archive folder (default /media/backup/archive) before you delete from
 # the phone; --sync-root/--archive-root override the defaults
+
+# open http://127.0.0.1:5000/purge/browse or /restore/browse to clean up
+# _to_delete folders -- purge permanently removes them (irreversible),
+# restore moves them back to where they were deleted from
 ```
 
 ## Important Constraints

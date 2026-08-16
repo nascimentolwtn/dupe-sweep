@@ -27,9 +27,10 @@ the Dart app).
   `list_subdirs()` (folder picker), recursive walks (`list_images()` for
   photos only, `list_files()` for every file), `read_bytes()` (prefetched,
   for fast full-file reads over SSH), `move_to_trash()` (move-not-delete,
-  with a `_1`/`_2` collision suffix instead of overwriting), and
-  `move_tree()` (recursive same-disk relocation for archive mode, see
-  below).
+  with a `_1`/`_2` collision suffix instead of overwriting), `move_tree()`
+  (recursive same-disk relocation for archive mode, see below), and
+  `find_trash_dirs()`/`count_trash()`/`purge_trash()`/`restore_trash()` for
+  cleaning up `_to_delete` folders (see Purge/restore mode below).
 - `scan_remote.py` — the heavy lifting: hashes + EXIF-timestamps every image
   found (`hash_cache.json`), clusters by time proximity then visual
   similarity, then scores sharpness/exposure (`score_cache.json`) and
@@ -41,7 +42,9 @@ the Dart app).
   with embedded thumbnails, and delete straight from the page (delete goes
   over SSH to the netbook immediately, no CSV/apply-step round trip); also
   hosts archive mode (`/archive/browse`, `/archive/confirm`, `POST
-  /archive`) — see below.
+  /archive` — see below) and purge/restore mode (`/purge/browse`,
+  `/purge/confirm`, `POST /purge`, `/restore/browse`, `/restore/confirm`,
+  `POST /restore` — see below).
 - `requirements.txt` — `pillow`, `imagehash`, `numpy`, `paramiko`, `flask`.
 
 ## Prerequisites
@@ -152,6 +155,41 @@ allow read/write/rename freely. This doesn't affect normal operation
 (archive mode only *reads* mtimes, never sets them), but it's worth
 knowing if you ever need to construct test fixtures with specific
 timestamps against this netbook.
+
+## Purge/restore mode: deleted photos are only ever moved, never unlinked
+
+`/delete` (and by extension the review page's "Delete marked" button) never
+actually removes a file — it moves it into a sibling `_to_delete` folder,
+same guarantee `python-mvp1` already has. Nothing purges those folders on
+its own; that's a deliberate, separate, opt-in step.
+
+```bash
+# open http://127.0.0.1:5000/purge/browse or /restore/browse (also linked
+# from the main review page, /browse, and /archive/browse)
+```
+
+Both modes share the same three-step flow, rooted at `--start-path` (same
+root as the main `/browse`, since `_to_delete` folders can turn up anywhere
+a scan/delete happened, not just under `--sync-root`):
+
+1. **`/purge/browse`** / **`/restore/browse`** — folder picker; pick the
+   subtree to operate on (e.g. the same folder you scanned and deleted
+   from).
+2. **`/purge/confirm`** / **`/restore/confirm`** — recursively finds every
+   `_to_delete` folder under the chosen path and previews how many folders/
+   files/bytes are involved before anything happens.
+3. **`POST /purge`** — **permanently deletes** those files (`sftp.remove()`)
+   and removes the now-empty `_to_delete` folders. This is the one
+   genuinely destructive, irreversible operation anywhere in this tool —
+   everything else in both `python-mvp1` and `python-mvp2-remote` only ever
+   moves files.
+   **`POST /restore`** — moves those files back to the folder each was
+   deleted from (undoing `move_to_trash()`), renaming on a name collision
+   (`_1`/`_2` suffix, same as `move_to_trash()`) instead of overwriting,
+   then removes the now-empty `_to_delete` folders.
+
+   Both return a summary: files affected, bytes affected, and (restore
+   only) how many were renamed for a collision, plus any per-file errors.
 
 ## Concurrency
 
