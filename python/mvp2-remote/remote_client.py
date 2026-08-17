@@ -295,6 +295,51 @@ def _sanitize_event_name(name):
     return "_".join(parts) or "Untitled"
 
 
+def move_into_folder(sftp, paths, dest_dir, min_age_seconds=300):
+    """Move a flat list of files directly into dest_dir -- no per-event
+    name-derived subfolder like move_grouped() creates, because dest_dir
+    here was picked by browsing to an existing folder (archive mode's
+    "move into existing event"), not named fresh. Same still-syncing
+    guard, collision-suffix safety, and move-not-delete guarantee as
+    move_tree()/move_grouped(). Returns one summary dict."""
+    dest_dir = str(dest_dir).rstrip("/")
+    now = time.time()
+    moved = 0
+    moved_bytes = 0
+    skipped_recent = 0
+    skipped_collision_renamed = 0
+    errors = []
+    for path in paths:
+        try:
+            info = sftp.stat(path)
+        except IOError as e:
+            errors.append((path, str(e)))
+            continue
+        if now - info.st_mtime < min_age_seconds:
+            skipped_recent += 1
+            continue
+        name = path.rsplit("/", 1)[-1]
+        dest = f"{dest_dir}/{name}"
+        try:
+            _ensure_dir(sftp, dest_dir)
+            final_dest = _resolve_collision(sftp, dest)
+            if final_dest != dest:
+                skipped_collision_renamed += 1
+            sftp.rename(path, final_dest)
+            moved += 1
+            moved_bytes += info.st_size
+        except Exception as e:
+            errors.append((path, str(e)))
+    return {
+        "dest": dest_dir,
+        "moved": moved,
+        "moved_bytes": moved_bytes,
+        "skipped_recent": skipped_recent,
+        "skipped_collision_renamed": skipped_collision_renamed,
+        "errors": errors,
+    }
+
+
 def move_grouped(sftp, events, dest_root, min_age_seconds=300):
     """Same-disk move like move_tree(), but destinations are explicit named
     groups instead of one recursive relative-structure mirror: `events` is
@@ -302,50 +347,15 @@ def move_grouped(sftp, events, dest_root, min_age_seconds=300):
     user-edited event groupings from archive mode's "group into events"
     review UI. Each event's files land in dest_root/<sanitized name>/;
     two events sanitizing to the same name simply share that destination
-    folder, no special-casing needed. Same still-syncing guard,
-    collision-suffix safety, and move-not-delete guarantee as move_tree().
-    Returns a list of per-event summary dicts."""
+    folder, no special-casing needed. Returns a list of per-event summary
+    dicts (see move_into_folder, which does the actual per-event move)."""
     dest_root = str(dest_root).rstrip("/")
-    now = time.time()
-
     summaries = []
     for event in events:
         dest_dir = f"{dest_root}/{_sanitize_event_name(event['name'])}"
-        moved = 0
-        moved_bytes = 0
-        skipped_recent = 0
-        skipped_collision_renamed = 0
-        errors = []
-        for path in event["paths"]:
-            try:
-                info = sftp.stat(path)
-            except IOError as e:
-                errors.append((path, str(e)))
-                continue
-            if now - info.st_mtime < min_age_seconds:
-                skipped_recent += 1
-                continue
-            name = path.rsplit("/", 1)[-1]
-            dest = f"{dest_dir}/{name}"
-            try:
-                _ensure_dir(sftp, dest_dir)
-                final_dest = _resolve_collision(sftp, dest)
-                if final_dest != dest:
-                    skipped_collision_renamed += 1
-                sftp.rename(path, final_dest)
-                moved += 1
-                moved_bytes += info.st_size
-            except Exception as e:
-                errors.append((path, str(e)))
-        summaries.append({
-            "name": event["name"],
-            "dest": dest_dir,
-            "moved": moved,
-            "moved_bytes": moved_bytes,
-            "skipped_recent": skipped_recent,
-            "skipped_collision_renamed": skipped_collision_renamed,
-            "errors": errors,
-        })
+        summary = move_into_folder(sftp, event["paths"], dest_dir, min_age_seconds)
+        summary["name"] = event["name"]
+        summaries.append(summary)
     return summaries
 
 

@@ -304,6 +304,17 @@ def _save_event_scan_result(data):
         json.dump(data, f)
 
 
+def _known_event_paths():
+    """Every image/other path the last completed event scan actually
+    found, for validating that a move/confirm request only touches files
+    this tool itself surfaced -- see the scope checks in
+    archive_events_confirm and archive_events_move_into."""
+    scan_result = _load_event_scan_result()
+    if not scan_result:
+        return set()
+    return set(scan_result["images"]) | {o["path"] for o in scan_result["others"]}
+
+
 def _prune_event_scan_result(moved_paths):
     """Drop `moved_paths` from the persisted scan result after a confirm
     (whether a single per-event confirm or the bulk one), removing the file
@@ -656,6 +667,12 @@ EVENT_REVIEW_TEMPLATE = """<!DOCTYPE html>
   .event-header .confirm-event-btn { background: #16a34a; color: #fff; border: none;
                                       padding: 6px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; }
   .event-header .confirm-event-btn:hover:not(:disabled) { filter: brightness(1.1); }
+  .event-header .move-into-btn { background: #7c3aed; color: #fff; border: none;
+                                  padding: 6px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; }
+  .event-header .move-into-btn:hover:not(:disabled) { filter: brightness(1.1); }
+  .event-header .split-btn { background: #b45309; color: #fff; border: none;
+                              padding: 6px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; }
+  .event-header .split-btn:hover:not(:disabled) { filter: brightness(1.1); }
   .event-header button:disabled { opacity: 0.5; cursor: default; }
   .files { display: flex; gap: 12px; flex-wrap: wrap; }
   .file-card { width: 170px; border: 2px solid transparent; border-radius: 8px; padding: 6px; position: relative; }
@@ -663,6 +680,9 @@ EVENT_REVIEW_TEMPLATE = """<!DOCTYPE html>
   .file-card img { width: 100%; height: 150px; object-fit: cover; border-radius: 6px; display: block; background: #eee; }
   .file-card .no-thumb { width: 100%; height: 150px; border-radius: 6px; background: #e5e7eb; display: flex;
                           align-items: center; justify-content: center; font-size: 28px; color: #9ca3af; }
+  .file-card .split-check { position: absolute; top: 10px; right: 10px; background: rgba(255,255,255,0.85);
+                             border-radius: 5px; padding: 3px; line-height: 0; }
+  .file-card .split-check input { display: block; margin: 0; width: 17px; height: 17px; cursor: pointer; }
   .file-meta { font-size: 10.5px; color: #555; margin-top: 5px; line-height: 1.3; word-break: break-all; }
   .file-controls { display: flex; align-items: center; justify-content: space-between; margin-top: 4px; }
   .file-controls label { font-size: 11px; display: flex; align-items: center; gap: 4px; }
@@ -674,6 +694,27 @@ EVENT_REVIEW_TEMPLATE = """<!DOCTYPE html>
   .empty { text-align: center; padding: 40px; color: #888; }
   .result-row { padding: 10px 0; border-bottom: 1px solid #eee; font-size: 13px; }
   .result-row .err { color: #ef4444; }
+  .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.5); z-index: 100;
+                    display: none; align-items: center; justify-content: center; padding: 16px; }
+  .modal-box { background: #fff; border-radius: 10px; padding: 20px; max-width: 480px; width: 100%;
+               max-height: 80vh; display: flex; flex-direction: column; }
+  .modal-box h3 { margin: 0 0 10px; font-size: 15px; }
+  .modal-path { font-size: 12px; font-family: ui-monospace, Consolas, monospace; color: #666;
+                word-break: break-all; margin-bottom: 10px; }
+  .modal-error { color: #ef4444; font-size: 12px; margin-bottom: 10px; display: none; }
+  .modal-list { list-style: none; padding: 0; margin: 0; overflow-y: auto; flex: 1 1 auto;
+                border: 1px solid #eee; border-radius: 6px; min-height: 80px; }
+  .modal-list li { border-bottom: 1px solid #f0f0f0; }
+  .modal-list li:last-child { border-bottom: none; }
+  .modal-list a { display: block; padding: 9px 10px; color: #1d1f24; text-decoration: none; font-size: 13px; }
+  .modal-list a:hover { background: #f4f5f7; }
+  .modal-list .empty-hint { padding: 10px; color: #999; font-size: 12px; }
+  .modal-actions { display: flex; gap: 8px; margin-top: 14px; }
+  .modal-actions button { flex: 1; padding: 10px; border: none; border-radius: 6px; font-size: 13px; cursor: pointer; }
+  .modal-actions button.primary { background: #7c3aed; color: #fff; }
+  .modal-actions button.secondary { background: #e5e7eb; color: #1d1f24; }
+  .modal-actions button:hover:not(:disabled) { filter: brightness(1.05); }
+  .modal-actions button:disabled { opacity: 0.5; cursor: default; }
   @media (max-width: 700px) {
     header { padding: 10px 12px; gap: 8px 10px; }
     header .path { flex: 1 1 100%; order: 3; }
@@ -698,6 +739,18 @@ EVENT_REVIEW_TEMPLATE = """<!DOCTYPE html>
   <button id="confirm-btn" class="danger">Confirm: move these events to archive</button>
 </header>
 <main id="main"></main>
+<div class="modal-overlay" id="folder-modal">
+  <div class="modal-box">
+    <h3>Move event into existing folder</h3>
+    <div class="modal-path" id="modal-path"></div>
+    <div class="modal-error" id="modal-error"></div>
+    <ul class="modal-list" id="modal-list"></ul>
+    <div class="modal-actions">
+      <button id="modal-cancel-btn" class="secondary">Cancel</button>
+      <button id="modal-select-btn" class="primary">Move here</button>
+    </div>
+  </div>
+</div>
 <script>
 const ALL_FILES = __FILES_JSON__;
 const ARCHIVE_ROOT = __ARCHIVE_ROOT_JSON__;
@@ -716,6 +769,20 @@ function suggestName(startTs, endTs) {
   const fmt = t => new Date(t).toISOString().slice(0, 10);
   const a = fmt(startTs), b = fmt(endTs);
   return a === b ? a : `${a} to ${b}`;
+}
+
+// Name suggestion for a manually split-off sub-event: a split is usually
+// carved out of one existing event, so its date is almost always the same
+// as the event it came from -- naming it by date again would just repeat
+// the parent's name. Use a time-of-day range instead when it's a single
+// day, falling back to suggestName's date range for the rare split that
+// still spans midnight.
+function suggestSplitName(startTs, endTs) {
+  const day = t => new Date(t).toISOString().slice(0, 10);
+  const time = t => new Date(t).toISOString().slice(11, 16);
+  if (day(startTs) !== day(endTs)) return suggestName(startTs, endTs);
+  const a = time(startTs), b = time(endTs);
+  return a === b ? `${day(startTs)} ${a}` : `${day(startTs)} ${a}-${b}`;
 }
 
 function clusterEvents(files, gapSeconds) {
@@ -785,6 +852,9 @@ function fileCardHtml(f) {
     : `<div class="no-thumb">&#128206;</div>`;
   return `
     <div class="file-card ${f.excluded ? 'excluded' : ''}" data-path="${escapeHtml(f.path)}">
+      <label class="split-check" title="Select to split into a new event">
+        <input type="checkbox" data-action="toggle-split" ${f.splitSelected ? 'checked' : ''}>
+      </label>
       ${thumb}
       <div class="file-meta">${escapeHtml(f.name)}<br>${f.ts.replace('T', ' ').slice(0, 16)}</div>
       <div class="file-controls">
@@ -806,6 +876,8 @@ function eventCardHtml(e, i, total) {
         <span class="event-meta">${e.files.length} file(s), ${suggestName(e.startTs, e.endTs)}</span>
         <div class="event-actions">
           ${i > 0 ? '<button class="merge-btn" data-action="merge-prev">Merge with previous event</button>' : ''}
+          <button class="move-into-btn" data-action="move-into" title="Move into an existing archive folder">Move into existing event</button>
+          <button class="split-btn" data-action="split-event" title="Split checked photos into a new event">Split selected into new event</button>
           <button class="confirm-event-btn" data-action="confirm-event">Confirm this event</button>
         </div>
       </div>
@@ -853,6 +925,38 @@ function moveFile(idx, path, dir) {
   render();
 }
 
+// Carves the files checked via each file-card's top-right checkbox out of
+// event `idx` into a brand-new event inserted right after it.
+function splitEvent(idx) {
+  const e = STATE[idx];
+  if (!e) return;
+  const selected = e.files.filter(f => f.splitSelected);
+  if (!selected.length) {
+    alert('Check the files to split off first (top-right checkbox on each photo).');
+    return;
+  }
+  if (selected.length === e.files.length) {
+    alert('Select fewer than all files -- splitting everything would leave this event empty.');
+    return;
+  }
+
+  e.files = e.files.filter(f => !f.splitSelected);
+  recomputeEvent(e);
+
+  selected.forEach(f => { f.splitSelected = false; });
+  selected.sort((a, b) => a.tsMs - b.tsMs);
+  const newEvent = {
+    files: selected,
+    startTs: selected[0].tsMs,
+    endTs: selected[selected.length - 1].tsMs,
+    uid: nextEventUid++,
+  };
+  newEvent.name = suggestSplitName(newEvent.startTs, newEvent.endTs);
+
+  STATE.splice(idx + 1, 0, newEvent);
+  render();
+}
+
 document.getElementById('recluster-btn').addEventListener('click', recluster);
 
 document.getElementById('main').addEventListener('click', (ev) => {
@@ -869,6 +973,10 @@ document.getElementById('main').addEventListener('click', (ev) => {
     moveFile(idx, path, action === 'move-prev' ? -1 : 1);
   } else if (action === 'confirm-event') {
     confirmEvent(card.dataset.eventUid);
+  } else if (action === 'move-into') {
+    openFolderPicker(card.dataset.eventUid);
+  } else if (action === 'split-event') {
+    splitEvent(idx);
   }
 });
 
@@ -893,12 +1001,15 @@ document.getElementById('main').addEventListener('error', (ev) => {
 }, true);
 
 document.getElementById('main').addEventListener('change', (ev) => {
-  if (ev.target.dataset.action !== 'toggle-exclude') return;
+  const action = ev.target.dataset.action;
+  if (action !== 'toggle-exclude' && action !== 'toggle-split') return;
   const card = ev.target.closest('.event-card');
   const idx = parseInt(card.dataset.eventIndex, 10);
   const path = ev.target.closest('.file-card').dataset.path;
   const f = STATE[idx].files.find(x => x.path === path);
-  if (f) f.excluded = ev.target.checked;
+  if (!f) return;
+  if (action === 'toggle-exclude') f.excluded = ev.target.checked;
+  else f.splitSelected = ev.target.checked;
 });
 
 // Moves a single event, identified by its stable uid (not array position --
@@ -946,6 +1057,102 @@ async function confirmEvent(uid) {
     btn.textContent = 'Confirm this event';
   }
 }
+
+// Folder-picker modal for "Move into existing event" -- lets one event's
+// files be moved into an archive folder chosen by browsing, instead of a
+// fresh dest_root/<event name> folder like confirmEvent() creates.
+let folderPickerEventUid = null;
+let folderPickerPath = ARCHIVE_ROOT;
+
+async function loadFolderList(path) {
+  const list = document.getElementById('modal-list');
+  list.innerHTML = '<li class="empty-hint">Loading&hellip;</li>';
+  const resp = await fetch('/archive/events/pick-folder?path=' + encodeURIComponent(path));
+  const data = await resp.json();
+  folderPickerPath = data.path;
+  document.getElementById('modal-path').textContent = data.path;
+
+  const errBox = document.getElementById('modal-error');
+  if (data.error) {
+    errBox.textContent = 'Could not list this folder: ' + data.error;
+    errBox.style.display = 'block';
+  } else {
+    errBox.style.display = 'none';
+  }
+
+  let html = '';
+  if (data.parent) html += `<li><a href="#" data-nav="${escapeHtml(data.parent)}">.. (up)</a></li>`;
+  const base = data.path.endsWith('/') ? data.path.slice(0, -1) : data.path;
+  for (const d of (data.subdirs || [])) {
+    const full = base + '/' + d;
+    html += `<li><a href="#" data-nav="${escapeHtml(full)}">${escapeHtml(d)}/</a></li>`;
+  }
+  list.innerHTML = html || '<li class="empty-hint">No subfolders here.</li>';
+}
+
+function openFolderPicker(uid) {
+  folderPickerEventUid = uid;
+  document.getElementById('folder-modal').style.display = 'flex';
+  loadFolderList(folderPickerPath);
+}
+
+function closeFolderPicker() {
+  document.getElementById('folder-modal').style.display = 'none';
+  folderPickerEventUid = null;
+}
+
+document.getElementById('modal-list').addEventListener('click', (ev) => {
+  const a = ev.target.closest('[data-nav]');
+  if (!a) return;
+  ev.preventDefault();
+  loadFolderList(a.dataset.nav);
+});
+
+document.getElementById('modal-cancel-btn').addEventListener('click', closeFolderPicker);
+
+document.getElementById('folder-modal').addEventListener('click', (ev) => {
+  if (ev.target.id === 'folder-modal') closeFolderPicker();  // backdrop click
+});
+
+document.getElementById('modal-select-btn').addEventListener('click', async () => {
+  const e = STATE.find(x => String(x.uid) === String(folderPickerEventUid));
+  if (!e) { closeFolderPicker(); return; }
+
+  const paths = e.files.filter(f => !f.excluded).map(f => f.path);
+  if (!paths.length) { alert('Nothing to move in this event -- everything is marked "skip".'); return; }
+  if (!confirm(`Move event "${e.name}" (${paths.length} file(s)) into ${folderPickerPath}?`)) return;
+
+  const btn = document.getElementById('modal-select-btn');
+  btn.disabled = true;
+  btn.textContent = 'Moving...';
+  try {
+    const resp = await fetch('/archive/events/move-into', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({paths, dest: folderPickerPath}),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Move failed');
+
+    const moved = new Set(paths);
+    for (let i = ALL_FILES.length - 1; i >= 0; i--) {
+      if (moved.has(ALL_FILES[i].path)) ALL_FILES.splice(i, 1);
+    }
+    e.files = e.files.filter(f => f.excluded);
+    const idx = STATE.indexOf(e);
+    if (e.files.length === 0) {
+      if (idx >= 0) STATE.splice(idx, 1);
+    } else {
+      recomputeEvent(e);
+    }
+    closeFolderPicker();
+    render();
+  } catch (err) {
+    alert('Move failed: ' + err.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Move here';
+  }
+});
 
 document.getElementById('confirm-btn').addEventListener('click', async () => {
   const events = STATE
@@ -2303,8 +2510,7 @@ def archive_events_confirm():
     # unauthenticated, 0.0.0.0-bound endpoint could rename an arbitrary
     # absolute path on the remote host by crafting the request body
     # directly, not just a photo the scan found.
-    scan_result = _load_event_scan_result()
-    known_paths = set(scan_result["images"]) | {o["path"] for o in scan_result["others"]} if scan_result else set()
+    known_paths = _known_event_paths()
     submitted = [p for e in events for p in e["paths"]]
     unknown = [p for p in submitted if p not in known_paths]
     if unknown:
@@ -2324,6 +2530,75 @@ def archive_events_confirm():
     _prune_event_scan_result(submitted)
 
     return jsonify({"summaries": summaries})
+
+
+def _within_archive_root(path):
+    """True if `path` is CONFIG["archive_root"] itself or somewhere under
+    it. Used to keep the "move into existing event" folder picker (and the
+    move it triggers) confined to the archive tree -- it exists to pick an
+    existing destination event folder, not to browse or move-to anywhere
+    on the remote filesystem."""
+    root = CONFIG["archive_root"].rstrip("/")
+    path = path.rstrip("/") or "/"
+    return path == root or path.startswith(root + "/")
+
+
+@app.route("/archive/events/pick-folder")
+def archive_events_pick_folder():
+    """JSON folder listing for the "move into existing event" picker
+    modal on the review page -- deliberately a small JSON endpoint rather
+    than a full page like /archive/browse, so picking a destination for
+    one event doesn't blow away the in-progress merges/splits/renames the
+    user has made to every other event on the page (those only exist in
+    that page's client-side STATE, never persisted server-side)."""
+    archive_root = CONFIG["archive_root"].rstrip("/")
+    path = posixpath.normpath(request.args.get("path") or archive_root)
+    if not _within_archive_root(path):
+        path = archive_root
+
+    try:
+        subdirs = _sftp_call(lambda sftp: remote_client.list_subdirs(sftp, path))
+        error = None
+    except Exception as e:
+        subdirs = []
+        error = str(e)
+
+    parent = posixpath.dirname(path.rstrip("/")) or "/"
+    if path == archive_root or not _within_archive_root(parent):
+        parent = None  # already at (or above) archive_root -- no "up" link
+
+    return jsonify({"path": path, "parent": parent, "subdirs": subdirs, "error": error})
+
+
+@app.route("/archive/events/move-into", methods=["POST"])
+def archive_events_move_into():
+    """Moves a single event's files directly into an existing archive
+    folder chosen via the pick-folder modal, instead of a fresh
+    dest_root/<event name> folder like /archive/events/confirm creates."""
+    data = request.get_json(force=True, silent=True) or {}
+    paths = data.get("paths") or []
+    dest = data.get("dest")
+    if not paths or not dest:
+        return jsonify({"error": "Missing paths or destination folder."}), 400
+
+    dest = posixpath.normpath(dest)
+    if not _within_archive_root(dest):
+        return jsonify({"error": "Destination must be inside the archive folder."}), 400
+
+    known_paths = _known_event_paths()
+    unknown = [p for p in paths if p not in known_paths]
+    if unknown:
+        return jsonify({"error": f"Refusing to move paths outside the last scan: {unknown[:3]}"}), 400
+
+    try:
+        summary = _sftp_call(lambda sftp: remote_client.move_into_folder(
+            sftp, paths, dest, min_age_seconds=CONFIG["archive_min_age_seconds"],
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    _prune_event_scan_result(paths)
+    return jsonify({"summary": summary})
 
 
 @app.route("/purge/browse")
