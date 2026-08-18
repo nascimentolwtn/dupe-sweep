@@ -654,6 +654,8 @@ EVENT_REVIEW_TEMPLATE = """<!DOCTYPE html>
   header button.danger { background: #dc2626; }
   header button:hover:not(:disabled) { filter: brightness(1.1); }
   header button:disabled { opacity: 0.5; cursor: default; }
+  header a.nav-link { color: #93c5fd; font-size: 13px; text-decoration: none; padding: 4px 0; }
+  header a.nav-link:hover { text-decoration: underline; }
   main { padding: 16px; max-width: 1400px; margin: 0 auto; }
   .event-card { background: #fff; border-radius: 10px; padding: 14px 16px; margin-bottom: 14px; box-shadow: 0 1px 2px rgba(0,0,0,.06); }
   .event-header { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; flex-wrap: wrap; }
@@ -730,6 +732,7 @@ EVENT_REVIEW_TEMPLATE = """<!DOCTYPE html>
 <header>
   <h1>Group into events</h1>
   <span class="path">__SCAN_ROOT__</span>
+  <a class="nav-link" href="__CONFIRM_ARCHIVE_URL__">&larr; Confirm archive</a>
   <div class="gap-control">
     <label for="gap-input">Split events after a gap of</label>
     <input type="number" id="gap-input" min="1" step="1" value="__GAP_HOURS__">
@@ -737,6 +740,9 @@ EVENT_REVIEW_TEMPLATE = """<!DOCTYPE html>
     <button id="recluster-btn" class="secondary">Recluster</button>
   </div>
   <button id="confirm-btn" class="danger">Confirm: move these events to archive</button>
+  <a class="nav-link" href="/">Dedup &rarr;</a>
+  <a class="nav-link" href="/archive/browse">Archive &rarr;</a>
+  <a class="nav-link" href="__PURGE_BROWSE_URL__">Purge/restore &rarr;</a>
 </header>
 <main id="main"></main>
 <div class="modal-overlay" id="folder-modal">
@@ -764,6 +770,8 @@ let nextEventUid = 1;
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
+
+function fmtMB(bytes) { return (bytes / (1024 * 1024)).toFixed(1) + " MB"; }
 
 function suggestName(startTs, endTs) {
   const fmt = t => new Date(t).toISOString().slice(0, 10);
@@ -856,7 +864,7 @@ function fileCardHtml(f) {
         <input type="checkbox" data-action="toggle-split" ${f.splitSelected ? 'checked' : ''}>
       </label>
       ${thumb}
-      <div class="file-meta">${escapeHtml(f.name)}<br>${f.ts.replace('T', ' ').slice(0, 16)}</div>
+      <div class="file-meta">${escapeHtml(f.name)}<br>${f.ts.replace('T', ' ').slice(0, 16)} &middot; ${fmtMB(f.size)}</div>
       <div class="file-controls">
         <label><input type="checkbox" data-action="toggle-exclude" ${f.excluded ? 'checked' : ''}> skip</label>
         <div class="file-nav">
@@ -2462,18 +2470,26 @@ def archive_events_review():
         e = ts_cache.get(path)
         if not e:
             continue  # scan didn't finish caching this one -- shouldn't happen once "complete"
-        files.append({"path": path, "name": path.rsplit("/", 1)[-1], "ts": e["ts"], "is_image": True})
+        files.append({
+            "path": path, "name": path.rsplit("/", 1)[-1], "ts": e["ts"],
+            "is_image": True, "size": e.get("size", 0),
+        })
     for o in scan_result["others"]:
         files.append({
             "path": o["path"], "name": o["path"].rsplit("/", 1)[-1],
             "ts": datetime.fromtimestamp(o["mtime"]).isoformat(), "is_image": False,
+            "size": o.get("size", 0),
         })
 
     files_json_str = json.dumps(files).replace("</", "<\\/")
+    confirm_archive_url = url_for("archive_confirm", path=scan_result["root"])
+    purge_url = url_for("purge_browse", path=scan_result["root"])
     html = EVENT_REVIEW_TEMPLATE.replace("__FILES_JSON__", files_json_str)
     html = html.replace("__ARCHIVE_ROOT_JSON__", json.dumps(CONFIG["archive_root"]))
     html = html.replace("__GAP_HOURS__", str(EVENT_GAP_SECONDS // 3600))
     html = html.replace("__SCAN_ROOT__", str(escape(scan_result["root"])))
+    html = html.replace("__CONFIRM_ARCHIVE_URL__", str(escape(confirm_archive_url)))
+    html = html.replace("__PURGE_BROWSE_URL__", str(escape(purge_url)))
     return html
 
 

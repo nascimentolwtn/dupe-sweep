@@ -672,7 +672,7 @@ def scan_events(remote_folder, out_dir, *, host, port=22, username=None,
             "status": "complete",
             "total_files": len(all_files),
             "images": image_paths,
-            "others": [{"path": f["path"], "mtime": f["mtime"]} for f in other_files],
+            "others": [{"path": f["path"], "mtime": f["mtime"], "size": f["size"]} for f in other_files],
         }
     finally:
         pool.close()
