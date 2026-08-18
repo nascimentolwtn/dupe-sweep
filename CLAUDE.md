@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**DupeSweep** is a lightweight Flutter/Dart Android app for finding and reviewing duplicate photos on a device. It uses time-based clustering and perceptual hashing (dHash) to group similar photos, with manual selection + OS confirmation for deletion. Personal use only—no analytics, ads, or cloud sync.
+**DupeSweep** is a lightweight Flutter/Dart Android app for finding and reviewing duplicate photos on a device. It uses time-based clustering and perceptual hashing (dHash) to group similar photos, with manual selection + OS confirmation for deletion. No cloud sync/backup of the user's photo data, ever — but ads and Play Billing are planned monetization, see `.claude/napkin.md`.
 
 Key principle: **No auto-delete**. Every deletion requires explicit user selection and OS confirmation by design.
 
@@ -300,7 +300,7 @@ python3 serve_review.py --host 192.168.4.36 --out-dir ./run
 
 ## Important Constraints
 
-1. **No Cloud**: This is a personal tool. Do not add cloud sync, analytics, or telemetry.
+1. **No Cloud Save/Sync**: Never sync or back up the user's photo data (paths, thumbnails, metadata) to any cloud service. Ad SDKs and Google Play Billing are explicitly OK (planned monetization — see `.claude/napkin.md`) even though they involve network calls; the restriction is about not shipping the user's own photo library data off-device, not about network access in general.
 2. **Explicit Deletion**: Every delete requires user confirmation + OS dialog. No silent deletes.
 3. **Android First**: iOS support is aspirational but not validated. Prioritize Android.
 4. **Privacy**: Never log or transmit photo data, paths, or metadata beyond the device.

@@ -269,9 +269,27 @@ Backlog item to prepare DupeSweep for public release on Google Play Store.
 - **Status**: Not started
 - **Effort**: TBD — requires app signing setup, Play Store account, metadata preparation
 
+### Free tier: ads + capped deletes
+Add a free tier gated by ads and usage limits.
+- **Scope**: Show ads during scanning (duplicates/blurry/large-file); cap how
+  many dupe/blurry/large-file deletions a free user can perform (exact
+  limits TBD).
+- **Status**: Not started
+- **Effort**: TBD — ad SDK integration + delete-count tracking/gating.
+
+### Paid tier: pay-as-you-go + subscription
+Two paid options once the free tier exists.
+- **Tier 1 (pay-as-you-go)**: buy a quantity of dedup deletions.
+- **Subscription**: removes ads, unlimited dedup deletions.
+- **Status**: Not started
+- **Depends on**: Free tier's ad/limit plumbing above, plus Google Play
+  Billing integration.
+- **Effort**: TBD — Play Billing integration, entitlement state, restore-
+  purchase flow.
+
 ## Constraints & Gotchas
 
-**No Cloud**: This is a personal tool. Never add analytics, telemetry, or cloud sync.
+**No Cloud Save/Sync**: Never sync or back up the user's photo data (paths, thumbnails, metadata) to any cloud service. Ad SDKs and Google Play Billing are explicitly OK (planned monetization — see Release & Play Store Publication) even though they involve network calls; the restriction is about not shipping the user's own photo library data off-device, not about network access in general.
 **Explicit Deletion**: Every delete requires user confirmation + OS dialog. No silent deletes.
 **Android First**: iOS support is aspirational but untested. Do not spend time on it yet.
 **Scoped Storage**: A general any-file large-file/junk finder needs MANAGE_EXTERNAL_STORAGE (Play-Store-incompatible, file-manager-role only). The implemented large-file finder (2026-08-14, item 8) is scoped to the photo/video library instead, avoiding that permission — a general filesystem version and the cache/junk cleaner both remain cut for this reason.

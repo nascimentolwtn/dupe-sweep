@@ -2,7 +2,7 @@
 
 **Version: 1.4.7**
 
-A lightweight Android app for finding and reviewing duplicate photos on your phone. Designed for personal use only (no analytics, ads, or cloud upload).
+A lightweight Android app for finding and reviewing duplicate photos on your phone. Your photo data is never uploaded or synced to the cloud. (Ads and a paid tier are planned — see the backlog.)
 
 ## Build & Run
 
@@ -95,7 +95,7 @@ lib/
 - **No auto-delete**: Every deletion requires explicit user selection and OS confirmation. This is by design.
 - **Thumbnails only**: Scanning uses small thumbnails (200x200) for speed, not full-res images.
 - **Off-UI-thread**: Photo scanning uses `compute()` (Dart isolates) to prevent UI freeze on large libraries.
-- **Personal use**: This app has no cloud sync, analytics, or ads. It's built for your own phone.
+- **No cloud sync**: Your photo data (paths, thumbnails, metadata) never leaves your device. Ads and a paid tier are planned (see roadmap/backlog) but won't change this.
 
 ## Testing
 
