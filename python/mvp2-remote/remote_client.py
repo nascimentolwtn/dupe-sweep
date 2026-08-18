@@ -11,20 +11,25 @@ in python-mvp1/find_duplicate_photos.py and apply_delete_list.py, adapted
 for SFTP (which has no os.walk equivalent).
 """
 
+import hashlib
+import json
+import mimetypes
 import re
 import shlex
 import stat
 import time
 from pathlib import PurePosixPath
+from urllib.parse import quote
 
 import paramiko
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
+VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".m4v", ".3gp", ".webm"}
 EXCLUDE_PREFIXES = (".trashed-", ".temp-", ".pending-")
 TRASH_DIRNAME = "_to_delete"
 
 
-def _exec(client, cmd, timeout=120):
+def _exec(client, cmd, timeout=120, stdin_bytes=None):
     """Run `cmd` on the remote host via SSH exec (not SFTP) and return
     (stdout_bytes, stderr_text, exit_code). Used for whole-tree operations
     (find/rm/du) -- dramatically faster than SFTP's per-item request/
@@ -35,6 +40,11 @@ def _exec(client, cmd, timeout=120):
     folder *browsing* (list_subdirs, cheap and interactive), bulk file
     reads (read_bytes, below), and the fine-grained per-file rename/
     collision handling that move_to_trash/restore_trash/move_tree need.
+
+    stdin_bytes, if given, is written to the command before closing stdin --
+    used by queue_video_thumbnails() to hand a JSON payload to a remote
+    python3 one-liner without shell-quoting hundreds of file paths onto the
+    command line itself.
 
     MUST drain stdout/stderr before calling recv_exit_status(): SSH
     channels are flow-controlled by a receive window (paramiko's default is
@@ -48,6 +58,8 @@ def _exec(client, cmd, timeout=120):
     _in, out, err = client.exec_command(cmd, timeout=timeout)
     chan = out.channel
     try:
+        if stdin_bytes is not None:
+            _in.write(stdin_bytes)
         _in.close()
         data = out.read()
         errtext = err.read().decode("utf-8", errors="replace")
@@ -55,6 +67,126 @@ def _exec(client, cmd, timeout=120):
         return data, errtext, rc
     finally:
         chan.close()
+
+
+def play_video_on_netbook(client, remote_path, username, seconds=15, display=":0.0"):
+    """Plays remote_path directly on the netbook's own X display via SSH
+    exec, instead of streaming the file over SSH to this PC -- for the
+    "Open on Netbook" preview button in the Group-into-events review page.
+
+    Uses mplayer -vo xv: measured against a real Atom N270 + Intel GMA945
+    netbook at roughly half the CPU of parole (GTK/GStreamer) for the same
+    file, since -vo xv offloads scaling/colorspace conversion to the GPU's
+    Xv extension. Launched detached (setsid ... & disown) so this returns
+    almost immediately rather than blocking the caller for `seconds` --
+    validated manually: digital_frame.sh's feh slideshow keeps cycling
+    underneath, completely untouched, and mplayer's new fullscreen window
+    is simply raised on top of it by the running window manager. `timeout`
+    auto-kills mplayer with SIGTERM after `seconds` (confirmed to exit
+    cleanly, no lingering process or broken VT) so a preview never lingers
+    -- digital_frame.sh will paint a new feh on top again on its own next
+    cycle regardless, which is expected and fine for a short preview."""
+    xauthority = f"/home/{username}/.Xauthority"
+    cmd = (
+        f"DISPLAY={shlex.quote(display)} XAUTHORITY={shlex.quote(xauthority)} "
+        f"setsid timeout {int(seconds)} mplayer -fs -vo xv -zoom -really-quiet "
+        f"{shlex.quote(str(remote_path))} >/dev/null 2>&1 </dev/null & disown"
+    )
+    _exec(client, cmd, timeout=10)
+
+
+def video_thumb_uri(remote_path):
+    """freedesktop.org thumbnail-spec URI for remote_path -- must match
+    exactly what Thunar/tumbler themselves construct (file:// + percent-
+    encoded path), since the cache filename is MD5 of this exact string."""
+    return "file://" + quote(str(remote_path), safe="/")
+
+
+def video_thumb_hash(remote_path):
+    return hashlib.md5(video_thumb_uri(remote_path).encode("utf-8")).hexdigest()
+
+
+def video_thumb_cache_path(remote_path, username):
+    """Where Thunar/tumbler would cache remote_path's thumbnail, per the
+    freedesktop.org thumbnail spec: ~/.cache/thumbnails/normal/<md5 of the
+    file:// URI>.png -- confirmed against a real cached entry on the
+    netbook (its Thumb::MTime tag matched the source file's actual mtime
+    exactly)."""
+    return f"/home/{username}/.cache/thumbnails/normal/{video_thumb_hash(remote_path)}.png"
+
+
+def list_thumbnail_cache_hashes(client):
+    """Every hash already cached under ~/.cache/thumbnails/{normal,large}
+    on the netbook, via one native `find` call -- lets the scan figure out
+    in a single round trip which videos already have a Thunar/tumbler
+    thumbnail, instead of one SFTP stat() per video."""
+    cmd = (
+        "find ~/.cache/thumbnails/normal ~/.cache/thumbnails/large "
+        "-maxdepth 1 -name '*.png' -printf '%f\\n' 2>/dev/null"
+    )
+    out, _err, _rc = _exec(client, cmd)
+    return {
+        line.rsplit(".", 1)[0]
+        for line in out.decode("utf-8", errors="replace").splitlines()
+        if line.strip()
+    }
+
+
+def queue_video_thumbnails(client, remote_paths, display=":0.0"):
+    """Force Thunar's D-Bus thumbnailing service (tumblerd) to generate
+    cache entries for remote_paths, instead of decoding video frames
+    ourselves for the Group-into-events review grid.
+
+    Validated live against the real netbook: tumbler-gst-thumbnailer.so and
+    python3-dbus are already installed (no new dependency needed), no video
+    bytes ever leave the netbook (GStreamer decodes locally where the file
+    already lives), and it handles container quirks (moov atom at the end
+    of the file, common for Android-recorded MP4s) that a naive prefix read
+    can't -- sidestepping the bandwidth problem a local ffmpeg-based
+    approach would have had.
+
+    Fire-and-forget: Queue() hands the work to tumblerd's own background
+    queue and returns almost immediately regardless of batch size (queuing
+    382 videos in one call took under a second); the actual thumbnails
+    land in ~/.cache/thumbnails/normal/ over the following seconds-to-
+    minutes (measured ~0.7-0.8/sec on a real Atom N270), so this
+    deliberately does not wait for them -- the scan can finish and the user
+    can start reviewing while tumblerd keeps working in the background.
+
+    JSON is piped over stdin (see _exec's stdin_bytes) rather than built
+    into the command line, since shell-quoting hundreds of arbitrary file
+    paths onto one command string is exactly the kind of thing that breaks
+    silently on the one path with a quote or unicode character in it."""
+    if not remote_paths:
+        return
+    uris = [video_thumb_uri(p) for p in remote_paths]
+    mimes = [mimetypes.guess_type(u)[0] or "video/mp4" for u in uris]
+    payload = json.dumps(list(zip(uris, mimes))).encode("utf-8")
+    script = (
+        "import sys, json, dbus\n"
+        "pairs = json.load(sys.stdin)\n"
+        "uris = [p[0] for p in pairs]\n"
+        "mimes = [p[1] for p in pairs]\n"
+        "bus = dbus.SessionBus()\n"
+        "obj = bus.get_object('org.freedesktop.thumbnails.Thumbnailer1',"
+        " '/org/freedesktop/thumbnails/Thumbnailer1')\n"
+        "iface = dbus.Interface(obj, 'org.freedesktop.thumbnails.Thumbnailer1')\n"
+        "iface.Queue(uris, mimes, 'normal', 'default', 0)\n"
+    )
+    cmd = (
+        "DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/$(id -u)/bus "
+        f"DISPLAY={shlex.quote(display)} python3 -c {shlex.quote(script)}"
+    )
+    _exec(client, cmd, timeout=30, stdin_bytes=payload)
+
+
+def read_video_thumbnail(sftp, remote_path, username):
+    """Read a video's already-generated Thunar/tumbler thumbnail PNG, if
+    one exists. Raises (typically FileNotFoundError) if tumblerd hasn't
+    generated it yet -- the caller (the review page's thumb route) treats
+    that the same as any other missing thumbnail."""
+    with sftp.open(video_thumb_cache_path(remote_path, username), "rb") as f:
+        return f.read()
 
 
 def connect(host, port=22, username=None, key_filename=None, password=None):

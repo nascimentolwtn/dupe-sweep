@@ -693,6 +693,10 @@ EVENT_REVIEW_TEMPLATE = """<!DOCTYPE html>
                       cursor: pointer; font-size: 12px; line-height: 1; }
   .file-nav button:hover:not(:disabled) { background: #ddd; }
   .file-nav button:disabled { opacity: 0.3; cursor: default; }
+  .play-btn { width: 100%; margin-top: 4px; background: #0369a1; color: #fff; border: none;
+              padding: 5px; border-radius: 5px; font-size: 11px; cursor: pointer; }
+  .play-btn:hover:not(:disabled) { filter: brightness(1.15); }
+  .play-btn:disabled { opacity: 0.6; cursor: default; }
   .empty { text-align: center; padding: 40px; color: #888; }
   .result-row { padding: 10px 0; border-bottom: 1px solid #eee; font-size: 13px; }
   .result-row .err { color: #ef4444; }
@@ -855,7 +859,7 @@ function recomputeEvent(e) {
 }
 
 function fileCardHtml(f) {
-  const thumb = f.is_image
+  const thumb = (f.is_image || f.is_video)
     ? `<img src="/archive/events/thumb?path=${encodeURIComponent(f.path)}" loading="lazy">`
     : `<div class="no-thumb">&#128206;</div>`;
   return `
@@ -872,6 +876,7 @@ function fileCardHtml(f) {
           <button data-action="move-next" title="Move to next event">&rarr;</button>
         </div>
       </div>
+      ${f.is_video ? `<button class="play-btn" data-action="play-on-netbook">&#9654; Open on Netbook (15s)</button>` : ''}
     </div>`;
 }
 
@@ -933,6 +938,30 @@ function moveFile(idx, path, dir) {
   render();
 }
 
+// Plays a video directly on the netbook's own display (see
+// remote_client.play_video_on_netbook) rather than fetching it to the
+// browser -- fire-and-forget, auto-stops itself after 15s server-side, so
+// this just disables the button for that long as visual feedback.
+async function playOnNetbook(path, btn) {
+  btn.disabled = true;
+  const original = btn.textContent;
+  btn.textContent = 'Playing on netbook (15s)...';
+  try {
+    const resp = await fetch('/archive/events/play', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({path}),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.error || 'Playback failed');
+  } catch (err) {
+    alert('Could not play on netbook: ' + err.message);
+    btn.disabled = false;
+    btn.textContent = original;
+    return;
+  }
+  setTimeout(() => { btn.disabled = false; btn.textContent = original; }, 15000);
+}
+
 // Carves the files checked via each file-card's top-right checkbox out of
 // event `idx` into a brand-new event inserted right after it.
 function splitEvent(idx) {
@@ -985,6 +1014,9 @@ document.getElementById('main').addEventListener('click', (ev) => {
     openFolderPicker(card.dataset.eventUid);
   } else if (action === 'split-event') {
     splitEvent(idx);
+  } else if (action === 'play-on-netbook') {
+    const path = ev.target.closest('.file-card').dataset.path;
+    playOnNetbook(path, btn);
   }
 });
 
@@ -2475,10 +2507,11 @@ def archive_events_review():
             "is_image": True, "size": e.get("size", 0),
         })
     for o in scan_result["others"]:
+        is_video = posixpath.splitext(o["path"])[1].lower() in remote_client.VIDEO_EXTS
         files.append({
             "path": o["path"], "name": o["path"].rsplit("/", 1)[-1],
             "ts": datetime.fromtimestamp(o["mtime"]).isoformat(), "is_image": False,
-            "size": o.get("size", 0),
+            "size": o.get("size", 0), "is_video": is_video,
         })
 
     files_json_str = json.dumps(files).replace("</", "<\\/")
@@ -2495,21 +2528,37 @@ def archive_events_review():
 
 @app.route("/archive/events/thumb")
 def archive_events_thumb():
-    """Lazy-loaded thumbnail for the event-review grid, read straight from
-    event_thumb_cache.json (see _load_event_cache's memoization) -- no SSH
-    involved, this only ever reads a local disk cache the scan already
-    populated, so it doesn't contend with _client_lock. Exists because
-    inlining every photo's base64 thumbnail into one review page response
-    made both that response and every merge/recluster re-render heavy at
-    "every photo in the folder" scale."""
+    """Lazy-loaded thumbnail for the event-review grid. Photos are read
+    straight from event_thumb_cache.json (see _load_event_cache's
+    memoization) -- no SSH involved, so that path doesn't contend with
+    _client_lock. Exists because inlining every photo's base64 thumbnail
+    into one review page response made both that response and every merge/
+    recluster re-render heavy at "every photo in the folder" scale.
+
+    Videos aren't in that local cache (they're never decoded by this app --
+    see queue_video_thumbnails()); for those, read whatever Thunar/tumbler
+    has already generated directly off the netbook's own thumbnail cache.
+    404s if tumblerd hasn't gotten to it yet -- the frontend already falls
+    back to the paperclip placeholder on a thumb load error, same as any
+    other file without one, so a rescan/reload later picks it up once the
+    background queue catches up."""
     path = request.args.get("path")
     if not path:
         abort(400)
     thumb_cache = _load_event_cache("event_thumb_cache.json")
     b64 = thumb_cache.get(path)
-    if not b64:
+    if b64:
+        resp = Response(base64.b64decode(b64), mimetype="image/jpeg")
+        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return resp
+
+    if path not in _known_event_paths():
         abort(404)
-    resp = Response(base64.b64decode(b64), mimetype="image/jpeg")
+    try:
+        data = _sftp_call(lambda sftp: remote_client.read_video_thumbnail(sftp, path, CONFIG["username"]))
+    except Exception:
+        abort(404)
+    resp = Response(data, mimetype="image/png")
     resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
     return resp
 
@@ -2615,6 +2664,30 @@ def archive_events_move_into():
 
     _prune_event_scan_result(paths)
     return jsonify({"summary": summary})
+
+
+@app.route("/archive/events/play", methods=["POST"])
+def archive_events_play():
+    """"Open on Netbook" button for video files on the review page: plays
+    the file directly on the netbook's own display over SSH exec (see
+    remote_client.play_video_on_netbook) instead of streaming it to this
+    PC. Fire-and-forget -- the video is launched detached and auto-stops
+    itself after 15s, so this route returns as soon as it's launched."""
+    data = request.get_json(force=True, silent=True) or {}
+    path = data.get("path")
+    if not path:
+        return jsonify({"error": "Missing path."}), 400
+    if path not in _known_event_paths():
+        return jsonify({"error": "Refusing to play a path outside the last scan."}), 400
+
+    try:
+        _ssh_call(lambda client: remote_client.play_video_on_netbook(
+            client, path, CONFIG["username"], seconds=15,
+        ))
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    return jsonify({"ok": True})
 
 
 @app.route("/purge/browse")

@@ -135,6 +135,12 @@ class ConnectionPool:
             self._local.sftp = client.open_sftp()
         return self._local.sftp
 
+    def get_client(self):
+        """The raw SSHClient behind get_sftp(), for SSH-exec calls (find,
+        D-Bus) rather than SFTP -- see queue_video_thumbnails()."""
+        self.get_sftp()
+        return self._local.client
+
     def close(self):
         with self._all_lock:
             clients, self._all_clients = self._all_clients, []
@@ -665,6 +671,32 @@ def scan_events(remote_folder, out_dir, *, host, port=22, username=None,
         )
         if not thumb_done:
             return {"status": "incomplete", "stage": "thumbnailing"}
+
+        # Force-generate Thunar/tumbler thumbnails for any video in this
+        # scan that doesn't already have one cached, instead of decoding
+        # video frames ourselves -- see queue_video_thumbnails()'s
+        # docstring. Fire-and-forget: this stage only queues the work
+        # (one native `find` + one D-Bus call, both fast regardless of
+        # how many videos), it doesn't wait for tumblerd to finish
+        # generating them -- those land in the netbook's own thumbnail
+        # cache over the following seconds-to-minutes while the user is
+        # already on the review page.
+        if progress_cb:
+            progress_cb("video thumbnails", 0, 0)
+        video_paths = [
+            f["path"] for f in other_files
+            if PurePosixPath(f["path"]).suffix.lower() in remote_client.VIDEO_EXTS
+        ]
+        if video_paths:
+            client = pool.get_client()
+            existing_hashes = remote_client.list_thumbnail_cache_hashes(client)
+            missing = [
+                p for p in video_paths
+                if remote_client.video_thumb_hash(p) not in existing_hashes
+            ]
+            remote_client.queue_video_thumbnails(client, missing)
+        if progress_cb:
+            progress_cb("video thumbnails", len(video_paths), len(video_paths))
 
         if progress_cb:
             progress_cb("done", len(image_paths), len(image_paths))
